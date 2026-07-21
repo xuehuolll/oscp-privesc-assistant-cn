@@ -1,0 +1,29 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Local reports / transcripts (may contain secrets)
+*.log
+*_test.txt
+_test*
+report*.txt
+opassist*.txt
+*.transcript
+
+# Temp / agent
+.tmp/
+.temp/
+__pycache__/
+
+# Secrets (never commit)
+.env
+*.pem
+*.key
+id_rsa*
+credentials*

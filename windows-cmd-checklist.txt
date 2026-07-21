@@ -1,0 +1,186 @@
+# OSCP Windows 纯 CMD 第一轮枚举清单（可粘贴）
+# 适用：只有 cmd、不便落地脚本、或脚本跑不动时
+# 合规：只枚举/观察；不自动利用、不改服务/计划任务、不上传 payload
+# 对应脚本：opassist-win-cn.bat（有文件落地时优先跑脚本）
+# 版本：1.8.8-cn
+
+================================================================
+0) 落地脚本时（优先）
+================================================================
+:: 把 opassist-win-cn.bat 传到目标后：
+opassist-win-cn.bat
+opassist-win-cn.bat --full
+opassist-win-cn.bat --no-color -o C:\Users\Public\opassist.txt
+
+================================================================
+1) 我是谁 / 权限 / 组（必做）
+================================================================
+whoami
+whoami /user
+whoami /priv
+whoami /groups
+whoami /all
+
+:: 重点看 Enabled：
+:: SeImpersonatePrivilege / SeAssignPrimaryTokenPrivilege
+:: SeBackupPrivilege / SeRestorePrivilege / SeDebugPrivilege
+:: 组里是否有 Administrators / S-1-5-32-544
+
+systeminfo
+systeminfo | findstr /B /C:"OS Name" /C:"OS Version" /C:"System Type" /C:"Hotfix(s)" /C:"Domain"
+
+================================================================
+2) AlwaysInstallElevated（双开才算数）
+================================================================
+reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+reg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated
+
+================================================================
+3) AutoLogon / 明文密码注册表
+================================================================
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" | findstr /i "DefaultUserName DefaultDomainName DefaultPassword AutoAdminLogon"
+reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+
+================================================================
+4) Unattend / Sysprep（常有管理员密码）
+================================================================
+dir /a C:\Windows\Panther\Unattend.xml C:\Windows\Panther\Unattended.xml 2>nul
+dir /a C:\Windows\System32\Sysprep\Unattend.xml C:\Windows\System32\Sysprep\Panther\Unattend.xml 2>nul
+dir /a C:\sysprep\Unattend.xml C:\sysprep\sysprep.xml 2>nul
+
+:: 若存在：
+findstr /ni /i "password administrator username domain" C:\Windows\Panther\Unattend.xml
+
+================================================================
+5) SAM/SYSTEM 备份可读？
+================================================================
+dir /a C:\Windows\Repair\SAM C:\Windows\Repair\SYSTEM 2>nul
+dir /a C:\Windows\System32\config\RegBack 2>nul
+icacls C:\Windows\Repair\SAM 2>nul
+icacls C:\Windows\System32\config\RegBack\SAM 2>nul
+
+================================================================
+6) 保存的凭据 / 客户端配置
+================================================================
+cmdkey /list
+
+dir /a "%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" 2>nul
+type "%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" 2>nul
+findstr /ni /i "password passwd pwd credential cmdkey runas net use sqlcmd ssh winrm" "%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" 2>nul
+
+dir /a "%APPDATA%\FileZilla\sitemanager.xml" "%APPDATA%\WinSCP.ini" 2>nul
+dir /a "%APPDATA%\mRemoteNG\confCons.xml" "%LOCALAPPDATA%\mRemoteNG\confCons.xml" 2>nul
+reg query "HKCU\Software\SimonTatham\PuTTY\Sessions" 2>nul
+reg query "HKCU\Software\SimonTatham\PuTTY\Sessions" /s 2>nul
+
+================================================================
+7) Web / 配置文件强特征（先定点，再扩大）
+================================================================
+dir /a C:\inetpub\wwwroot\web.config 2>nul
+findstr /ni /i "connectionString password pwd= Data Source Initial Catalog secret token" C:\inetpub\wwwroot\web.config 2>nul
+
+:: 有权限再扫（可能慢）：
+findstr /s /i /m /c:"password=" /c:"pwd=" /c:"connectionString" C:\inetpub\*.config 2>nul
+findstr /s /i /m /c:"password=" /c:"pwd=" C:\xampp\*.* 2>nul
+findstr /s /i /m /c:"password=" /c:"connectionString" C:\ProgramData\*.config 2>nul
+
+================================================================
+8) 服务：未加引号路径 + 可写目录（核心）
+================================================================
+:: 有 wmic 时：
+wmic service get Name,PathName,StartName,StartMode,State /format:list
+
+:: 无 wmic 时逐个：
+sc query state= all
+:: 对可疑服务：
+sc qc SERVICENAME
+sc sdshow SERVICENAME
+icacls "C:\Path\To\ServiceDir"
+
+:: 手工判断清单：
+:: A) PathName 含空格且未用引号包住 .exe ？
+:: B) 以 LocalSystem / NT AUTHORITY / Admin 运行？
+:: C) 服务二进制目录或中间路径当前用户可写？
+:: 只有 A+B+C 或 B+C 才优先投入时间
+
+================================================================
+9) 计划任务（高权限 + 可写路径）
+================================================================
+schtasks /query /fo LIST /v
+
+:: 重点字段：TaskName / Run As User / Task To Run
+:: 中文系统可能是：任务名 / 运行身份的用户 / 要运行的任务
+:: 筛选思路：Run As = SYSTEM/Administrators，且路径在 Users/Temp/ProgramData/inetpub 或父目录可写
+
+schtasks /query /tn "\TaskPath\Name" /fo LIST /v
+icacls "C:\path\to\task\exe\dir"
+
+================================================================
+10) PATH 劫持线索
+================================================================
+echo %PATH%
+:: 对每个目录：
+icacls "C:\Some\PathDir"
+:: 仅当高权限程序用“相对命令名”启动时才有意义
+
+================================================================
+11) 自启动线索
+================================================================
+reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+reg query "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+dir /a "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+dir /a "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+icacls "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+
+================================================================
+12) 本地端口 / 用户
+================================================================
+netstat -ano | findstr LISTENING
+netstat -ano | findstr "127.0.0.1"
+
+net user
+net localgroup administrators
+net localgroup
+
+:: 域环境（若 whoami 显示域）：
+whoami /fqdn
+net user /domain
+net group /domain
+net group "Domain Admins" /domain
+
+================================================================
+13) 写权限快速探针（可选；会创建后立即删除临时文件）
+================================================================
+:: 示例：测某目录是否可写
+echo.> "%TEMP%\opassist_write_test.tmp" && del /f /q "%TEMP%\opassist_write_test.tmp" && echo WRITABLE || echo NOT
+
+================================================================
+14) 解读优先级（和 bat summary 一致）
+================================================================
+P0 立刻验证：
+  - 明文/配置凭据、AutoLogon、Unattend、可读 SAM 备份
+  - SeImpersonate/SeAssignPrimaryToken/SeBackup/SeDebug Enabled
+  - AlwaysInstallElevated 双开
+  - 高权限服务/计划任务：二进制或目录可写
+
+P1 值得看：
+  - cmdkey、客户端配置、web.config 强特征
+  - 未加引号路径且中间目录可写
+  - 本地 3306/1433/6379/8080 等 + 配置文件账密
+
+P2 没结果再上：
+  - WinPEAS / Seatbelt / SharpUp
+  - 内核/CVE（考试最后手段）
+
+================================================================
+15) 纯 CMD 做不到 / 需手工补的
+================================================================
+- 服务 DACL「能否 sc config」精细判断 → sc sdshow + 人工读 SDDL
+- PowerShell ConstrainedLanguage / Defender 状态 → 需要 powershell
+- 无副作用完美 ACL 解析 → icacls 人工看，或临时文件探针
+- 超大盘深度秘密扫描 → 控制路径，避免全盘 findstr /s
+
+================================================================
+结束
+================================================================
+# 报告里不要无意义粘贴完整明文密码；保留路径、命令、脱敏证据即可。
