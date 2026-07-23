@@ -1,44 +1,38 @@
 # OSCP Privesc Assistant (CN)
 
-Local privilege-escalation **enumeration + hints** helper for **Linux / Windows**.
+Local privilege-escalation **enumeration + hints** helper for Linux and Windows.
 
-本地提权枚举 + 提示助手（Linux / Windows）。
+- Collect evidence, rank findings, suggest **manual** next-step commands
+- Does **not** auto-exploit, modify services/tasks/registry persistence, upload payloads, or brute-force credentials
+- Intended for OSCP / PG / authorized lab environments only
 
-- Collect evidence, rank priority, suggest **manual** next commands  
-  只收集证据、标优先级、给下一步手工验证命令
-- **No** auto exploit / service-task-registry persistence / payload upload / brute force  
-  **不**自动利用、**不**改服务/计划任务/注册表持久化、**不**上传 payload、**不**爆破
-- For OSCP / PG / authorized labs only  
-  仅用于 OSCP / PG / 授权实验环境
-
-> Use only on systems you are allowed to test.  
-> 仅用于你有权测试的系统，滥用后果自负。
+> Use only on systems you own or have explicit permission to test.
 
 ---
 
-## Files / 文件
+## Repository layout
 
 `	ext
 .
-├── README.md
-├── LICENSE
-├── .gitignore
-├── opassist-linux-cn.sh          # Linux
-├── Invoke-OPAssist-CN.ps1        # Windows PowerShell (recommended)
-├── opassist-win-cn.bat           # Windows CMD fallback
-└── windows-cmd-checklist.txt     # paste checklist
+|-- README.md
+|-- LICENSE
+|-- .gitignore
+|-- opassist-linux-cn.sh          # Linux main script
+|-- Invoke-OPAssist-CN.ps1        # Windows PowerShell (recommended)
+|-- opassist-win-cn.bat           # Windows pure CMD fallback
+|-- windows-cmd-checklist.txt     # paste checklist when file drop is hard
 `
 
-| Scenario / 场景 | Use / 用什么 |
-|----------|-----|
+| Scenario | Use this |
+|----------|----------|
 | Linux shell | opassist-linux-cn.sh |
 | Windows + PowerShell | Invoke-OPAssist-CN.ps1 |
 | Windows cmd only | opassist-win-cn.bat |
-| Cannot drop files / 不能传文件 | windows-cmd-checklist.txt |
+| Cannot transfer files | windows-cmd-checklist.txt |
 
 ---
 
-## Quick start / 快速开始
+## Quick start
 
 ### Linux
 
@@ -47,9 +41,10 @@ chmod +x opassist-linux-cn.sh
 ./opassist-linux-cn.sh
 ./opassist-linux-cn.sh --full
 ./opassist-linux-cn.sh -o report.txt
+./opassist-linux-cn.sh --report -o report.txt
 `
 
-### Windows (PowerShell)
+### Windows (PowerShell, recommended)
 
 `powershell
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1
@@ -57,7 +52,7 @@ powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -Full
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -OutFile C:\Users\Public\opassist.txt
 `
 
-### Windows (CMD)
+### Windows (pure CMD)
 
 `at
 opassist-win-cn.bat
@@ -67,9 +62,9 @@ opassist-win-cn.bat -o C:\Users\Public\opassist.txt
 
 ---
 
-## Output / 输出
+## Output style
 
-Default **privesc-only summary** (默认只显示能推进提权的证据).
+Default mode is a **privesc-only summary**: only evidence that can advance privilege escalation.
 
 `	ext
 [n]
@@ -79,47 +74,50 @@ Default **privesc-only summary** (默认只显示能推进提权的证据).
       manual command ...
 `
 
-- HIGH first; MED capped; use -Full / --full for more  
-- Kernel CVE is not primary  
+- **HIGH** first; **MED** is capped; use -Full / --full for more detail
+- Kernel CVE is not the primary path
 
-### Windows PS special behavior / Windows 特殊逻辑
+### Windows PowerShell special behavior
 
 | Situation | Behavior |
 |-----------|----------|
-| Already **SYSTEM** | Skip fake writable service/task spam; still scan creds/configs/domain loot |
-| Domain + no local HIGH | **DOMAIN MODE** playbook (SYSVOL / identity / AD next steps) |
-| Web/DB configs | List interesting config **paths** ([maybe-secret] flag only; no secret dump) |
+| Already **SYSTEM** | Skip fake writable service/task spam; still scan creds, configs, domain loot |
+| Domain + no local HIGH | Emit **DOMAIN MODE** playbook (SYSVOL / identity / AD next steps) |
+| Web / DB configs | List interesting config **paths** (optional [maybe-secret] flag; secrets are not dumped) |
 
 ---
 
-## Compliance / 合规
+## Compliance boundary
 
 | Allowed | Forbidden |
 |---------|-----------|
-| Local enumeration | Auto exploit |
-| Hints + suggested commands | Change services/tasks/registry persistence |
-| Optional report file | Upload/run payload |
-| ACL-based write checks (PS) | Credential brute force |
+| Local enumeration | Auto exploit / auto privesc |
+| Risk highlight + suggested commands | Changing services, tasks, or registry persistence |
+| Optional report save | Uploading or running payloads |
+| ACL-based write checks (PowerShell) | Credential spraying / brute force |
+
+PowerShell edition prefers ACL-based write checks.  
+CMD edition may use short-lived temp write probes (deleted immediately).
 
 ---
 
-## Coverage / 覆盖 (摘要)
+## Coverage (short)
 
-**Linux:** groups, sudo, SUID/caps, cron/systemd write chains, cred/config scoring, service profiles, PATH, NFS/container.  
+**Linux (opassist-linux-cn.sh):** sensitive groups, sudo, SUID/capabilities, writable cron/systemd chains, credential/config scoring, service profiles, PATH, NFS/container hints.
 
-**Windows PS:** tokens, AIE, Autologon, Unattend, SAM backups, service write/unquoted/DACL, tasks (Microsoft noise filtered), PATH/Run/Startup, GPO/SYSVOL/GPP, creds, web/DB config inventory, ports, domain playbook, SYSTEM short-circuit.  
+**Windows PS (Invoke-OPAssist-CN.ps1):** tokens, AlwaysInstallElevated, Autologon, Unattend, SAM backups, service write/unquoted/weak DACL, scheduled tasks (Microsoft built-in noise filtered), PATH/Run/Startup, GPO/SYSVOL/GPP, credentials, web/DB config inventory, local ports, domain playbook, SYSTEM short-circuit.
 
-**Windows CMD:** main checks in pure cmd; less depth than PS.
+**Windows CMD (opassist-win-cn.bat):** main checks in pure cmd; less depth than the PowerShell edition.
 
 ---
 
-## Workflow / 建议流程
+## Suggested workflow
 
-1. Get shell -> run matching script  
-2. Verify HIGH, then MED  
-3. If empty -> linpeas / WinPEAS as second opinion  
-4. Domain + no local HIGH -> SYSVOL + AD enum first  
-5. CVE last  
+1. Get a shell, then run the matching script (default summary).
+2. Verify **HIGH**, then **MED**.
+3. If empty, use linpeas / WinPEAS / Seatbelt as a second opinion.
+4. On domain hosts with no local HIGH, prioritize SYSVOL and AD enum.
+5. Leave CVE hunting for last.
 
 ---
 
@@ -135,6 +133,6 @@ Default **privesc-only summary** (默认只显示能推进提权的证据).
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT. See [LICENSE](./LICENSE).
 
-Authorized testing / learning only. Redact secrets in reports.
+Authorized testing and learning only. Redact secrets from reports.
