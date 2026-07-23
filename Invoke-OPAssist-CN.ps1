@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.4-en-ps"
+$Version = "1.9.5-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 # Priority: higher prints first within same severity (domain playbook > local noise)
@@ -876,7 +876,29 @@ function Test-Services {
     }
 }
 
+function Test-IsHighPrivTaskPrincipal([string]$runAs) {
+    if (-not $runAs) { return $false }
+    # Real high-priv principals only. NOT Users / INTERACTIVE / Authenticated Users.
+    return [bool]($runAs -match '(?i)^(SYSTEM|LOCAL SYSTEM|NT AUTHORITY\\SYSTEM|LOCAL SERVICE|NT AUTHORITY\\LOCAL SERVICE|NETWORK SERVICE|NT AUTHORITY\\NETWORK SERVICE|S-1-5-18|S-1-5-19|S-1-5-20)$' -or
+        $runAs -match '(?i)\\SYSTEM$' -or
+        $runAs -match '(?i)Administrator')
+}
+
+function Test-IsMicrosoftBuiltinTaskPath([string]$taskPath, [string]$taskFile) {
+    # Built-in Microsoft tasks under System32\Tasks\Microsoft are almost never a real OSCP privesc
+    # for low-priv users; admin ACL false-positives create hundreds of HIGH noise findings.
+    if ($taskPath -match '(?i)\\Microsoft\\') { return $true }
+    if ($taskFile -match '(?i)\\System32\\Tasks\\Microsoft\\') { return $true }
+    return $false
+}
+
 function Test-ScheduledTasks {
+    $taskXmlHits = 0
+    $taskXmlCap = if ($Mode -eq "full") { 8 } else { 3 }
+    $taskOtherCap = if ($Mode -eq "full") { 15 } else { 8 }
+    $taskOtherHits = 0
+    $skippedMsXml = 0
+
     $tasks = @()
     try {
         $tasks = Get-ScheduledTask -ErrorAction Stop
@@ -887,37 +909,45 @@ function Test-ScheduledTasks {
             if ($csv) {
                 $parsed = $csv | ConvertFrom-Csv
                 foreach ($t in $parsed) {
+                    if ($taskOtherHits -ge $taskOtherCap) { break }
                     $runAs = $t.'Run As User'
                     $toRun = $t.'Task To Run'
                     $tname = $t.TaskName
                     if (-not $toRun) { continue }
                     if ($toRun -match 'N/A|COM handler') { continue }
-                    $isPriv = $runAs -match '(?i)SYSTEM|Administrator|LOCAL SERVICE|NETWORK SERVICE|LocalSystem|NT AUTHORITY'
-                    if (-not $isPriv) { continue }
+                    if (-not (Test-IsHighPrivTaskPrincipal $runAs)) { continue }
+                    # Skip Microsoft\Windows\... noise in CSV path if present in TaskName
+                    if ($tname -match '(?i)\\Microsoft\\Windows\\') { continue }
                     $path = Get-ExecutableFromCommand $toRun
                     if ($path) {
+                        if (Test-IsSystemPath $path) { continue }
                         $dir = Split-Path -Parent $path
                         if ((Test-Path -LiteralPath $path) -and (Test-AclWritable $path)) {
                             Add-Finding HIGH "Writable privileged scheduled-task binary: $path" `
                                 "Task=$tname RunAs=$runAs" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v`nicacls `"$path`"" `
-                                "task_file:$tname"
+                                "task_file:$tname" -Priority 90
+                            $taskOtherHits++
                         } elseif ($dir -and (Test-Path -LiteralPath $dir) -and (Test-AclWritable $dir)) {
                             Add-Finding HIGH "Writable privileged scheduled-task directory: $dir" `
                                 "Task=$tname RunAs=$runAs Cmd=$toRun" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v`nicacls `"$dir`"" `
-                                "task_dir:$tname"
+                                "task_dir:$tname" -Priority 89
+                            $taskOtherHits++
                         } elseif ($path -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\inetpub\\|\\xampp\\') {
                             Add-Finding MED "Privileged task points to non-standard path: $path" `
                                 "Task=$tname RunAs=$runAs" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v" `
-                                "task_ns:$tname"
+                                "task_ns:$tname" -Priority 60
+                            $taskOtherHits++
                         }
                     } elseif ($toRun -match '(?i)powershell|cmd\.exe|wscript|cscript|\.bat|\.cmd|\.ps1|\.vbs') {
+                        if ($toRun -match '(?i)%SystemRoot%|\\Windows\\System32\\') { continue }
                         Add-Finding MED "Privileged task runs script/interpreter: $tname" `
                             "RunAs=$runAs Cmd=$toRun. Extract script path and check ACL manually." `
                             "schtasks /query /tn `"$tname`" /fo LIST /v" `
-                            "task_script:$tname"
+                            "task_script:$tname" -Priority 55
+                        $taskOtherHits++
                     }
                 }
             }
@@ -927,63 +957,86 @@ function Test-ScheduledTasks {
 
     foreach ($t in $tasks) {
         try {
-            $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction SilentlyContinue
             $prin = $t.Principal
             $runAs = $prin.UserId
             if (-not $runAs) { $runAs = $prin.GroupId }
-            $isPriv = $runAs -match '(?i)SYSTEM|Administrator|LOCAL SERVICE|NETWORK SERVICE|LocalSystem|NT AUTHORITY|S-1-5-18|S-1-5-19|S-1-5-20'
-            if (-not $isPriv) {
-                # also treat RunLevel Highest + InteractiveToken carefully as MED later; skip most
-                if ($prin.RunLevel -ne "Highest") { continue }
-            }
+            $isPriv = Test-IsHighPrivTaskPrincipal ([string]$runAs)
+            # Do NOT treat RunLevel=Highest alone as priv (causes Users/INTERACTIVE spam)
+            if (-not $isPriv) { continue }
+
             $actions = $t.Actions
             foreach ($a in $actions) {
                 $exec = $a.Execute
                 $args = $a.Arguments
                 $cmd = ("$exec $args").Trim()
-                $fullName = Join-Path $t.TaskPath $t.TaskName
+                $fullName = ($t.TaskPath.TrimEnd('\','/') + '\' + $t.TaskName)
                 if (-not $exec) { continue }
 
-                # task definition writable?
-                $taskFile = "C:\Windows\System32\Tasks" + ($t.TaskPath -replace '/','\') + $t.TaskName
-                $taskFile = $taskFile -replace '\\+','\'
-                if (Test-Path -LiteralPath $taskFile -PathType Leaf) {
-                    if (Test-AclWritable $taskFile) {
+                $isMs = Test-IsMicrosoftBuiltinTaskPath $t.TaskPath ""
+
+                # Task XML write: ONLY non-Microsoft tasks (real privesc surface).
+                # Checking System32\Tasks\Microsoft\* as admin creates 200+ false HIGH findings.
+                if (-not $isMs -and $taskXmlHits -lt $taskXmlCap) {
+                    $taskFile = "C:\Windows\System32\Tasks" + ($t.TaskPath -replace '/','\') + $t.TaskName
+                    $taskFile = $taskFile -replace '\\+','\'
+                    if ((Test-Path -LiteralPath $taskFile -PathType Leaf) -and (Test-AclWritable $taskFile)) {
                         Add-Finding HIGH "Writable scheduled task definition: $taskFile" `
-                            "Task=$fullName RunAs=$runAs. Writable task XML is high-value." `
+                            "Task=$fullName RunAs=$runAs. Non-Microsoft task XML writable by current user — verify you can actually modify it (icacls + non-admin shell)." `
                             "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v`nicacls `"$taskFile`"" `
-                            "task_xml:$fullName"
+                            "task_xml:$fullName" -Priority 91
+                        $taskXmlHits++
                     }
+                } elseif ($isMs) {
+                    $skippedMsXml++
                 }
+
+                if ($taskOtherHits -ge $taskOtherCap) { continue }
 
                 $path = Get-ExecutableFromCommand $cmd
                 if (-not $path) { $path = $exec.Trim('"') }
+                # Skip pure Windows system binaries for "writable bin" noise when already admin
+                if ($path -and (Test-IsSystemPath $path)) {
+                    if ($Mode -ne "full") { continue }
+                }
+
                 if ($path -and (Test-Path -LiteralPath $path)) {
                     $dir = Split-Path -Parent $path
-                    if (Test-AclWritable $path) {
+                    if ((-not (Test-IsSystemPath $path)) -and (Test-AclWritable $path)) {
                         Add-Finding HIGH "Writable privileged scheduled-task binary: $path" `
                             "Task=$fullName RunAs=$runAs" `
-                            "Get-ScheduledTask -TaskName '$($t.TaskName)' | fl *`nicacls `"$path`"" `
-                            "task_bin:$fullName"
-                    } elseif ($dir -and (Test-AclWritable $dir)) {
+                            "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v`nicacls `"$path`"" `
+                            "task_bin:$fullName" -Priority 90
+                        $taskOtherHits++
+                    } elseif ($dir -and (-not (Test-IsSystemPath $dir)) -and (Test-AclWritable $dir)) {
                         Add-Finding HIGH "Writable privileged scheduled-task directory: $dir" `
                             "Task=$fullName RunAs=$runAs Cmd=$cmd" `
                             "icacls `"$dir`"`ndir `"$dir`"" `
-                            "task_dir2:$fullName"
+                            "task_dir2:$fullName" -Priority 89
+                        $taskOtherHits++
+                    } elseif ($path -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\inetpub\\') {
+                        Add-Finding MED "Privileged task non-standard path: $path" `
+                            "Task=$fullName RunAs=$runAs" `
+                            "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v" `
+                            "task_ns2:$fullName" -Priority 60
+                        $taskOtherHits++
                     }
-                } elseif ($path -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\inetpub\\') {
-                    Add-Finding MED "Privileged task non-standard path: $path" `
-                        "Task=$fullName RunAs=$runAs" `
-                        "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v" `
-                        "task_ns2:$fullName"
-                } elseif ($cmd -match '(?i)powershell|cmd\.exe|wscript|cscript|\.ps1|\.bat') {
+                } elseif ((-not $isMs) -and $cmd -match '(?i)powershell|cmd\.exe|wscript|cscript|\.ps1|\.bat') {
+                    if ($cmd -match '(?i)%SystemRoot%|\\Windows\\System32\\') { continue }
                     Add-Finding MED "Privileged task script/interpreter: $fullName" `
                         "RunAs=$runAs Cmd=$cmd" `
                         "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v" `
-                        "task_sc2:$fullName"
+                        "task_sc2:$fullName" -Priority 55
+                    $taskOtherHits++
                 }
             }
         } catch {}
+    }
+
+    if ($skippedMsXml -gt 0 -and $Mode -eq "full") {
+        Add-Finding INFO "Skipped $skippedMsXml Microsoft\\Windows built-in task XML write checks" `
+            "Built-in tasks under System32\Tasks\Microsoft are filtered to avoid admin ACL false positives. Not listed as HIGH." `
+            "# No action. If you need raw ACLs: icacls C:\Windows\System32\Tasks\Microsoft" `
+            "task_ms_skipped" -Priority 10
     }
 }
 
