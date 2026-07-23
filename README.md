@@ -114,7 +114,7 @@ Token 鏉冮檺銆丄lwaysInstallElevated銆丄utologon銆乁nattend銆丼AM 澶
 | 缁勪欢 | 鐗堟湰 |
 |------|------|
 | Linux | 1.8.8-cn |
-| Windows PowerShell | **1.9.5-en-ps** |
+| Windows PowerShell | **1.9.6-en-ps** |
 | Windows CMD | 1.8.8-cn-cmd |
 
 ### Windows PS recent hardening
@@ -132,3 +132,4 @@ Token 鏉冮檺銆丄lwaysInstallElevated銆丄utologon銆乁nattend銆丼AM 澶
 
 MIT 鈥?瑙?[LICENSE](./LICENSE)銆?
 浠呯敤浜庢巿鏉冩祴璇曚笌瀛︿範銆傛姤鍛婁腑璇疯劚鏁忥紝鍕跨矘璐存棤鎰忎箟鏄庢枃瀵嗙爜銆?
+

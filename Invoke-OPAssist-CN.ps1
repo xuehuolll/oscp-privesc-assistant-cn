@@ -21,9 +21,11 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.5-en-ps"
+$Version = "1.9.6-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
+$script:AlreadySystem = $false
+$script:SkipWriteChecks = $false  # true when SYSTEM / high-integrity admin (write checks are meaningless noise)
 # Priority: higher prints first within same severity (domain playbook > local noise)
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
@@ -557,14 +559,30 @@ function Invoke-AllChecks {
 
     Write-Host "[*] identity / groups / tokens ..."
     Test-IdentityAndTokens
+
+    if ($script:AlreadySystem) {
+        Write-Host "[*] Already SYSTEM - skipping write/ACL privesc checks (they only produce noise)."
+        Write-Host "[*] credentials / configs / domain loot still run ..."
+        Test-Credentials
+        Test-AppConfigInventory
+        Test-LocalPorts
+        Test-EnvHints
+        Complete-DomainGuidance
+        return
+    }
+
     Write-Host "[*] AlwaysInstallElevated / Autologon / Unattend / SAM ..."
     Test-ClassicMisconfigs
-    Write-Host "[*] services (write / unquoted / weak DACL) ..."
-    Test-Services
-    Write-Host "[*] scheduled tasks ..."
-    Test-ScheduledTasks
-    Write-Host "[*] PATH / autorun / startup / GPO ..."
-    Test-PathAndAutorun
+    if ($script:SkipWriteChecks) {
+        Write-Host "[*] Elevated admin - skipping service/task/PATH write sweeps (ACL always true)."
+    } else {
+        Write-Host "[*] services (write / unquoted / weak DACL) ..."
+        Test-Services
+        Write-Host "[*] scheduled tasks ..."
+        Test-ScheduledTasks
+        Write-Host "[*] PATH / autorun / startup / GPO ..."
+        Test-PathAndAutorun
+    }
     Write-Host "[*] credentials & local services ..."
     Test-Credentials
     Write-Host "[*] web/DB config file locations ..."
@@ -582,12 +600,48 @@ function Test-IdentityAndTokens {
     $groups = whoami /groups 2>$null
     $privText = ($privs | Out-String)
     $grpText = ($groups | Out-String)
+    $whoText = ($who | Out-String)
 
-    if ($grpText -match 'S-1-5-32-544|Administrators') {
+    # --- Already privileged? Stop generating 300 fake "writable" HIGHs ---
+    $isSystem = $false
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($id.User -and $id.User.Value -eq 'S-1-5-18') { $isSystem = $true }
+        if ($id.Name -match '(?i)NT AUTHORITY\\SYSTEM|^SYSTEM$') { $isSystem = $true }
+    } catch {}
+    if (-not $isSystem) {
+        if ($whoText -match '(?i)nt authority\\system' -or $grpText -match 'S-1-5-18' -or $grpText -match 'S-1-16-16384') {
+            $isSystem = $true
+        }
+    }
+    if ($isSystem) {
+        $script:AlreadySystem = $true
+        $script:SkipWriteChecks = $true
+        Add-Finding HIGH "ALREADY NT AUTHORITY\SYSTEM - local privesc complete" `
+            "Current token is SYSTEM (S-1-5-18). Do NOT hunt 'writable services/tasks' - as SYSTEM everything looks writable and is NOT a privesc lead. Collect proof/loot, then domain actions if needed." `
+            "whoami`nwhoami /priv`nwhoami /groups`nhostname`n# proof: type proof.txt / type local.txt as required by lab`n# If domain machine account context: consider domain pivot with care" `
+            "already_system" `
+            -Priority 100
+        [void]$script:Details.Add("whoami:`n$who`n`nprivs:`n$privText`ngroups:`n$grpText")
+        return
+    }
+
+    # High-integrity local admin: write checks on System32/Microsoft are useless noise
+    $highIntegrity = $grpText -match 'S-1-16-12288'
+    $inAdmins = $grpText -match 'S-1-5-32-544'
+    if ($inAdmins -and $highIntegrity) {
+        $script:SkipWriteChecks = $true
+        Add-Finding HIGH "Already elevated local Administrator (High Integrity)" `
+            "Full admin token. Skip service/task XML write hunting - ACL will show write on almost all system objects. Focus on loot/creds/domain." `
+            "whoami /groups`nwhoami /priv" `
+            "already_admin_high" `
+            -Priority 100
+    } elseif ($inAdmins) {
         Add-Finding HIGH "User may be in local Administrators" `
-            "If token is full admin, you may already have admin rights. Remote shells are often UAC-filtered." `
+            "If token is full admin, you may already have admin rights. Remote shells are often UAC-filtered (Medium integrity)." `
             "whoami /groups`nwhoami /priv`nwhoami /all`nnet localgroup administrators`n# If filtered admin: need another path or UAC bypass (manual)" `
-            "admin_group"
+            "admin_group" `
+            -Priority 95
     }
 
     # Privesc-relevant groups only. RDP/WinRM membership is access method, not local privesc.
@@ -1534,7 +1588,10 @@ if ($Mode -eq "full") { Print-FullDetails }
 
 Section "Result"
 Write-Host "HIGH: $High  MED: $Med  INFO: $Info"
-if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
+if ($script:AlreadySystem) {
+    Write-Host "Context: ALREADY SYSTEM - ignore any leftover write/ACL noise; local privesc is done."
+    Write-Host "Recommended: proof/loot files, then domain actions if this is a domain machine."
+} elseif ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
     Write-Host "Context: DOMAIN=$($script:DomainCtx.Dns)  DC=$($script:DomainCtx.IsDC)  User=$($script:DomainCtx.User)"
     if ($High -eq 0) {
         Write-Host "Recommended flow: DOMAIN loot (SYSVOL) -> domain enum -> better creds -> local privesc again."
