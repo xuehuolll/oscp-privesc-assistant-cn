@@ -12,7 +12,7 @@ Local privilege-escalation **enumeration + hints** helper for Linux and Windows.
 
 ## Repository layout
 
-`	ext
+```text
 .
 |-- README.md
 |-- LICENSE
@@ -21,14 +21,14 @@ Local privilege-escalation **enumeration + hints** helper for Linux and Windows.
 |-- Invoke-OPAssist-CN.ps1        # Windows PowerShell (recommended)
 |-- opassist-win-cn.bat           # Windows pure CMD fallback
 |-- windows-cmd-checklist.txt     # paste checklist when file drop is hard
-`
+```
 
 | Scenario | Use this |
 |----------|----------|
-| Linux shell | opassist-linux-cn.sh |
-| Windows + PowerShell | Invoke-OPAssist-CN.ps1 |
-| Windows cmd only | opassist-win-cn.bat |
-| Cannot transfer files | windows-cmd-checklist.txt |
+| Linux shell | `opassist-linux-cn.sh` |
+| Windows + PowerShell | `Invoke-OPAssist-CN.ps1` |
+| Windows cmd only | `opassist-win-cn.bat` |
+| Cannot transfer files | `windows-cmd-checklist.txt` |
 
 ---
 
@@ -36,29 +36,29 @@ Local privilege-escalation **enumeration + hints** helper for Linux and Windows.
 
 ### Linux
 
-`ash
+```bash
 chmod +x opassist-linux-cn.sh
 ./opassist-linux-cn.sh
 ./opassist-linux-cn.sh --full
 ./opassist-linux-cn.sh -o report.txt
 ./opassist-linux-cn.sh --report -o report.txt
-`
+```
 
 ### Windows (PowerShell, recommended)
 
-`powershell
+```powershell
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -Full
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -OutFile C:\Users\Public\opassist.txt
-`
+```
 
 ### Windows (pure CMD)
 
-`at
+```bat
 opassist-win-cn.bat
 opassist-win-cn.bat --full
 opassist-win-cn.bat -o C:\Users\Public\opassist.txt
-`
+```
 
 ---
 
@@ -66,15 +66,15 @@ opassist-win-cn.bat -o C:\Users\Public\opassist.txt
 
 Default mode is a **privesc-only summary**: only evidence that can advance privilege escalation.
 
-`	ext
+```text
 [n]
 !!! [HIGH] title
     Reason: ...
     Next:
       manual command ...
-`
+```
 
-- **HIGH** first; **MED** is capped; use -Full / --full for more detail
+- **HIGH** first; **MED** is capped; use `-Full` / `--full` for more detail
 - Kernel CVE is not the primary path
 
 ### Windows PowerShell special behavior
@@ -83,7 +83,7 @@ Default mode is a **privesc-only summary**: only evidence that can advance privi
 |-----------|----------|
 | Already **SYSTEM** | Skip fake writable service/task spam; still scan creds, configs, domain loot |
 | Domain + no local HIGH | Emit **DOMAIN MODE** playbook (SYSVOL / identity / AD next steps) |
-| Web / DB configs | List interesting config **paths** (optional [maybe-secret] flag; secrets are not dumped) |
+| Web / DB configs | List interesting config **paths** (optional `[maybe-secret]` flag; secrets are not dumped) |
 
 ---
 
@@ -103,11 +103,11 @@ CMD edition may use short-lived temp write probes (deleted immediately).
 
 ## Coverage (short)
 
-**Linux (opassist-linux-cn.sh):** sensitive groups, sudo, SUID/capabilities, writable cron/systemd chains, credential/config scoring, service profiles, PATH, NFS/container hints.
+**Linux (`opassist-linux-cn.sh`):** sensitive groups, sudo, SUID/capabilities, writable cron/systemd chains, credential/config scoring, service profiles, PATH, NFS/container hints.
 
-**Windows PS (Invoke-OPAssist-CN.ps1):** tokens, AlwaysInstallElevated, Autologon, Unattend, SAM backups, service write/unquoted/weak DACL, scheduled tasks (Microsoft built-in noise filtered), PATH/Run/Startup, GPO/SYSVOL/GPP, credentials, web/DB config inventory, local ports, domain playbook, SYSTEM short-circuit.
+**Windows PS (`Invoke-OPAssist-CN.ps1`):** tokens, AlwaysInstallElevated, Autologon, Unattend, SAM backups, service write/unquoted/weak DACL, scheduled tasks (Microsoft built-in noise filtered), PATH/Run/Startup, GPO/SYSVOL/GPP, credentials, web/DB config inventory, local ports, domain playbook, SYSTEM short-circuit.
 
-**Windows CMD (opassist-win-cn.bat):** main checks in pure cmd; less depth than the PowerShell edition.
+**Windows CMD (`opassist-win-cn.bat`):** main checks in pure cmd; less depth than the PowerShell edition.
 
 ---
 
@@ -124,7 +124,7 @@ CMD edition may use short-lived temp write probes (deleted immediately).
 ## Versions
 
 | Component | Version |
-|-----------|---------|
+|-----------|----------|
 | Linux | 1.8.8-cn |
 | Windows PowerShell | 1.9.6-en-ps |
 | Windows CMD | 1.8.8-cn-cmd |
