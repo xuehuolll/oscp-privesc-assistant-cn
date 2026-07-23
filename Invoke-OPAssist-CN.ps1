@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.6-en-ps"
+$Version = "1.9.7-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $script:AlreadySystem = $false
@@ -781,38 +781,144 @@ function Test-ClassicMisconfigs {
         }
     }
 
-    # Only report SAM/SYSTEM backups that are REALLY readable and non-empty.
-    # Mere existence of RegBack stubs is extremely common and not a lead.
-    $sam = @(
-        "C:\Windows\Repair\SAM","C:\Windows\Repair\SYSTEM","C:\Windows\Repair\SECURITY",
-        "C:\Windows\System32\config\RegBack\SAM","C:\Windows\System32\config\RegBack\SYSTEM","C:\Windows\System32\config\RegBack\SECURITY"
-    )
-    foreach ($p in $sam) {
-        if (-not (Test-Path -LiteralPath $p)) { continue }
-        $len = 0
-        try { $len = (Get-Item -LiteralPath $p -ErrorAction Stop).Length } catch { $len = 0 }
-        if ($len -lt 16) {
-            if ($Mode -eq "full") {
-                Add-Finding INFO "SAM/SYSTEM path exists but empty/tiny: $p" "Common RegBack stub; not useful alone." "dir `"$p`"" "sam_empty:$p"
-            }
-            continue
-        }
-        $readable = $false
+    # --- Hive / SAM+SYSTEM candidates (OSCP classic: Repair, RegBack, Windows.old) ---
+    Test-SamSystemHives
+}
+
+function Test-FileReadableNonEmpty([string]$Path, [int]$MinSize = 16) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $len = 0
+    try { $len = [int64](Get-Item -LiteralPath $Path -ErrorAction Stop).Length } catch { return $null }
+    if ($len -lt $MinSize) { return @{ Ok = $false; Len = $len; Why = "tiny" } }
+    try {
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        $fs.Close()
+        return @{ Ok = $true; Len = $len; Why = "readable" }
+    } catch {
+        # Some hives allow Read share differently; try read-only open
         try {
-            $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
-            $fs.Close(); $readable = $true
-        } catch { $readable = $false }
-        if ($readable) {
-            Add-Finding HIGH "Readable SAM/SYSTEM backup: $p (size=$len)" `
-                "Looks readable. Copy offline and extract hashes manually." `
-                "dir `"$p`"`nicacls `"$p`"`n# copy to writable dir then offline parse" `
-                "sam_read:$p"
-        } elseif ($Mode -eq "full") {
-            Add-Finding INFO "SAM/SYSTEM backup present but not readable: $p" `
-                "Only interesting with SeBackup or other read path." `
-                "dir `"$p`"`nicacls `"$p`"" `
-                "sam_exist:$p"
+            $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'Read')
+            $fs.Close()
+            return @{ Ok = $true; Len = $len; Why = "readable" }
+        } catch {
+            return @{ Ok = $false; Len = $len; Why = "locked_or_denied" }
         }
+    }
+}
+
+function Test-SamSystemHives {
+    # Fixed classic locations + Windows.old (very common OSCP/HTB path)
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $fixed = @(
+        "C:\Windows\Repair\SAM",
+        "C:\Windows\Repair\SYSTEM",
+        "C:\Windows\Repair\SECURITY",
+        "C:\Windows\System32\config\SAM",
+        "C:\Windows\System32\config\SYSTEM",
+        "C:\Windows\System32\config\SECURITY",
+        "C:\Windows\System32\config\RegBack\SAM",
+        "C:\Windows\System32\config\RegBack\SYSTEM",
+        "C:\Windows\System32\config\RegBack\SECURITY",
+        # Windows.old standard config hives
+        "C:\Windows.old\Windows\System32\config\SAM",
+        "C:\Windows.old\Windows\System32\config\SYSTEM",
+        "C:\Windows.old\Windows\System32\config\SECURITY",
+        "C:\Windows.old\Windows\System32\config\RegBack\SAM",
+        "C:\Windows.old\Windows\System32\config\RegBack\SYSTEM",
+        "C:\Windows.old\Windows\System32\config\RegBack\SECURITY",
+        "C:\Windows.old\Windows\Repair\SAM",
+        "C:\Windows.old\Windows\Repair\SYSTEM",
+        # Some images place hive copies oddly under System32 (seen in labs)
+        "C:\Windows.old\Windows\System32\SAM",
+        "C:\Windows.old\Windows\System32\SYSTEM",
+        "C:\Windows.old\Windows\System32\SECURITY",
+        # lowercase / alternate drive-style leftovers
+        "C:\windows.old\Windows\System32\config\SAM",
+        "C:\windows.old\Windows\System32\config\SYSTEM",
+        "C:\windows.old\Windows\System32\config\SECURITY",
+        "C:\windows.old\windows\System32\config\SAM",
+        "C:\windows.old\windows\System32\config\SYSTEM",
+        "C:\windows.old\windows\System32\config\SECURITY",
+        "C:\windows.old\windows\System32\SAM",
+        "C:\windows.old\windows\System32\SYSTEM",
+        "C:\windows.old\windows\System32\SECURITY"
+    )
+    foreach ($p in $fixed) { [void]$candidates.Add($p) }
+
+    # If Windows.old exists, surface it and search a few more hive names under it
+    $oldRoots = @("C:\Windows.old", "C:\windows.old")
+    foreach ($old in $oldRoots) {
+        if (-not (Test-Path -LiteralPath $old)) { continue }
+        Add-Finding HIGH "Windows.old directory present: $old" `
+            "OS upgrade leftover. Often contains readable SAM/SYSTEM hives or old user profiles with credentials. High-value OSCP path." `
+            "dir `"$old`"`ndir `"$old\Windows\System32\config`"`ndir `"$old\Windows\System32`"`ndir `"$old\Users`"" `
+            "windows_old:$old" `
+            -Priority 96
+
+        # Targeted search for hive file names (depth-limited, name filter only)
+        try {
+            $hiveNames = @('SAM', 'SYSTEM', 'SECURITY', 'SOFTWARE', 'DEFAULT')
+            Get-ChildItem -Path $old -Recurse -File -Depth 6 -ErrorAction SilentlyContinue |
+                Where-Object { $hiveNames -contains $_.Name } |
+                Select-Object -First 30 |
+                ForEach-Object { [void]$candidates.Add($_.FullName) }
+        } catch {}
+    }
+
+    # Also search other common backup folders (shallow)
+    foreach ($root in @("C:\", "C:\Backup", "C:\Backups", "C:\Temp", "C:\Users\Public")) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        try {
+            Get-ChildItem -Path $root -Filter "SAM" -File -ErrorAction SilentlyContinue | ForEach-Object { [void]$candidates.Add($_.FullName) }
+            Get-ChildItem -Path $root -Filter "SYSTEM" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                # avoid live volume named SYSTEM confusion; only small depth
+                if ($_.FullName -match '(?i)\\(config|repair|regback|windows\.old|backup)\\') {
+                    [void]$candidates.Add($_.FullName)
+                }
+            }
+        } catch {}
+    }
+
+    $seen = @{}
+    $readablePairHint = $false
+    foreach ($p in $candidates) {
+        if (-not $p) { continue }
+        $key = $p.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+
+        $st = Test-FileReadableNonEmpty $p 16
+        if (-not $st) { continue }
+
+        $base = Split-Path -Leaf $p
+        if ($st.Ok) {
+            if ($base -match '^(SAM|SYSTEM|SECURITY)$') {
+                $readablePairHint = $true
+            }
+            Add-Finding HIGH "Readable registry hive: $p (size=$($st.Len))" `
+                "File is readable by current user. Offline parse (secretsdump/impacket/samdump2 etc.) can yield local password hashes. Prefer SAM+SYSTEM together." `
+                "dir `"$p`"`nicacls `"$p`"`ncopy `"$p`" `$env:TEMP\`n# Need both SAM and SYSTEM for hash extraction when possible" `
+                "hive_read:$p" `
+                -Priority 97
+        } else {
+            if ($Mode -eq "full" -or ($p -match '(?i)windows\.old' -and $st.Why -ne "tiny")) {
+                Add-Finding INFO "Hive present but not readable: $p (size=$($st.Len); $($st.Why))" `
+                    "Exists but open failed (ACL/lock). Live hives under current Windows\System32\config are often locked." `
+                    "dir `"$p`"`nicacls `"$p`"" `
+                    "hive_locked:$p" `
+                    -Priority 25
+            } elseif ($st.Why -eq "tiny" -and $Mode -eq "full") {
+                Add-Finding INFO "Hive path empty/tiny: $p" "Common empty RegBack stub." "dir `"$p`"" "hive_tiny:$p" -Priority 10
+            }
+        }
+    }
+
+    if ($readablePairHint) {
+        Add-Finding MED "Tip: extract hashes with SAM + SYSTEM pair" `
+            "If you have readable SAM and SYSTEM (e.g. from Windows.old), copy both offline and run secretsdump/samdump style tools on your attack host." `
+            "# Example (attack host): secretsdump.py -sam SAM -system SYSTEM LOCAL" `
+            "hive_pair_tip" `
+            -Priority 80
     }
 }
 
@@ -1158,13 +1264,29 @@ function Test-PathAndAutorun {
     foreach ($s in $starts) {
         if (-not (Test-Path -LiteralPath $s)) { continue }
         $items = Get-ChildItem -LiteralPath $s -Force -ErrorAction SilentlyContinue
+        $isCommon = $s -match '(?i)ProgramData'
+        $isOwnProfile = $env:USERPROFILE -and $s.StartsWith($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase)
         if (Test-AclWritable $s) {
-            $sev = if ($s -match 'ProgramData') { "HIGH" } else { "MED" }
-            Add-Finding $sev "Writable Startup folder: $s" `
-                "Writable startup may affect logon items." `
-                "dir /a `"$s`"`nicacls `"$s`"" `
-                "startup:$s"
-        } elseif ($items) {
+            if ($isCommon) {
+                Add-Finding HIGH "Writable common Startup folder: $s" `
+                    "Writable ALL-USERS startup may affect other logons." `
+                    "dir /a `"$s`"`nicacls `"$s`"" `
+                    "startup:$s" -Priority 88
+            } elseif ($isOwnProfile) {
+                # Own user Startup is almost always writable - not a privesc lead
+                if ($Mode -eq "full") {
+                    Add-Finding INFO "Own user Startup is writable (expected): $s" `
+                        "Not a privilege escalation path by itself." `
+                        "dir /a `"$s`"" `
+                        "startup_own:$s" -Priority 5
+                }
+            } else {
+                Add-Finding MED "Writable Startup folder: $s" `
+                    "Writable startup may affect logon items." `
+                    "dir /a `"$s`"`nicacls `"$s`"" `
+                    "startup:$s" -Priority 50
+            }
+        } elseif ($items -and $Mode -eq "full") {
             Add-Finding INFO "Startup folder non-empty: $s" "Review contents and ACLs." "dir /a `"$s`"" "startup_info:$s"
         }
     }
