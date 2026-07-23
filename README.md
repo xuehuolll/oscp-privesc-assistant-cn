@@ -124,18 +124,17 @@ Token 权限、AlwaysInstallElevated、Autologon、Unattend、SAM 备份、服�
 | 组件 | 版本 |
 |------|------|
 | Linux | 1.8.8-cn |
-| Windows PowerShell | **1.9.1-en-ps** (English UI + domain playbook) |
+| Windows PowerShell | **1.9.3-en-ps** |
 | Windows CMD | 1.8.8-cn-cmd |
 
-### v1.9.x notes (from real Evil-WinRM / domain lab)
+### Windows PS recent hardening
 
-- English-only findings UI (fixes Chinese mojibake under WinRM)
-- Drop RDP/WinRM groups from MED noise (INFO only in `-Full`)
-- RegBack SAM: only report **readable + non-empty**
-- PATH: skip `WindowsApps` and user profile dirs
-- Ports: drop 445/139 noise
-- Detect `SeMachineAccountPrivilege`
-- **v1.9.1: when domain-joined and no local HIGH, emit clear DOMAIN playbook** (SYSVOL/NETLOGON commands, user/group enum, next AD steps). Detect DC via DomainRole.
+- English-only UI (WinRM-safe)
+- Less noise: RDP/WinRM groups, empty RegBack, WindowsApps PATH, SMB ports
+- Domain playbook when no local HIGH (single consolidated MED + commands)
+- Finding **priority sort** (domain playbook / GPP / service write first)
+- Faster service pass (skip System32 `sc sdshow` noise)
+- Stronger DC detection (ProductType, NTDS, local SYSVOL, hostname)
 
 ---
 

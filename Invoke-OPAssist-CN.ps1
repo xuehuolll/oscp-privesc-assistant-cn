@@ -21,9 +21,10 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.2-en-ps"
+$Version = "1.9.3-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
+# Priority: higher prints first within same severity (domain playbook > local noise)
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
 if ($Report) { $NoColor = $true }
@@ -93,7 +94,8 @@ function Add-Finding {
         [string]$Title,
         [string]$Reason,
         [string]$Next = "",
-        [string]$Key = ""
+        [string]$Key = "",
+        [int]$Priority = 50
     )
     if (-not $Key) { $Key = "$Severity`:$Title" }
     if ($script:FindingKeys.ContainsKey($Key)) { return }
@@ -103,12 +105,18 @@ function Add-Finding {
         Title    = $Title
         Reason   = $Reason
         Next     = $Next
+        Priority = $Priority
+        Order    = $script:Findings.Count
     })
     switch ($Severity) {
         "HIGH" { $script:High++ }
         "MED"  { $script:Med++ }
         default { $script:Info++ }
     }
+}
+
+function Get-SortedFindings([string]$Severity) {
+    return @($script:Findings | Where-Object { $_.Severity -eq $Severity } | Sort-Object -Property @{e='Priority';Descending=$true}, @{e='Order';Ascending=$true})
 }
 
 function Write-FindingObj($f) {
@@ -166,8 +174,7 @@ function Print-Summary {
     $n = 1
     $medPrinted = 0
     foreach ($sev in @("HIGH","MED")) {
-        foreach ($f in $script:Findings) {
-            if ($f.Severity -ne $sev) { continue }
+        foreach ($f in (Get-SortedFindings $sev)) {
             if ($sev -eq "MED" -and $Mode -ne "full") {
                 if ($medPrinted -ge $script:MaxMedSummary) { continue }
                 $medPrinted++
@@ -180,8 +187,7 @@ function Print-Summary {
     }
 
     if ($Mode -eq "full") {
-        foreach ($f in $script:Findings) {
-            if ($f.Severity -ne "INFO") { continue }
+        foreach ($f in (Get-SortedFindings "INFO")) {
             Write-Host "[$n]"
             Write-FindingObj $f
             Write-Host ""
@@ -418,11 +424,14 @@ function Get-DomainContext {
             $ctx.DcHow = "LocalPath=C:\Windows\SYSVOL\sysvol"
         }
     }
-    if (-not $ctx.IsDC -and $env:COMPUTERNAME -match '(?i)(^|-)DC\d*$|DC$|^DC') {
-        # Name heuristic only -> still mark DC candidate but weaker
-        $ctx.IsDC = $true
-        $ctx.IsDomain = $true
-        $ctx.DcHow = "HostnameHeuristic=$($env:COMPUTERNAME)"
+    if (-not $ctx.IsDC) {
+        $cn = [string]$env:COMPUTERNAME
+        # RESOURCEDC, DC01, CORP-DC, DC-01, etc.
+        if ($cn -match '(?i)DC\d*$' -or $cn -match '(?i)(^|-)DC($|-|\d)' -or $cn -match '(?i)DOMAINCONTROLLER') {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+            $ctx.DcHow = "HostnameHeuristic=$cn"
+        }
     }
     if (-not $ctx.IsDC -and $env:LOGONSERVER) {
         $ls = $env:LOGONSERVER.TrimStart('\').Trim()
@@ -440,94 +449,102 @@ function Get-DomainContext {
 
 function Complete-DomainGuidance {
     # Call AFTER all local checks so we know HIGH count.
+    # Emit ONE clear domain block when no local HIGH (avoids 3-4 redundant MED lines).
     $ctx = $script:DomainCtx
     if (-not $ctx -or -not $ctx.IsDomain) { return }
 
     $dns = if ($ctx.Dns) { $ctx.Dns } else { $ctx.NetBios }
     $sysvol = "\\$dns\SYSVOL"
     $netlogon = "\\$dns\NETLOGON"
+    $nl = [Environment]::NewLine
 
-    if ($ctx.IsDC) {
-        $how = if ($ctx.DcHow) { " (detected via $($ctx.DcHow))" } else { "" }
-        Add-Finding MED "Host appears to be a Domain Controller: $($ctx.Computer)$how" `
-            "You are on a DC as $($ctx.User). Local misconfig privesc is often sparse for low-priv domain users. Prefer AD/domain paths: SYSVOL loot, user/group enum, kerberos, ACLs/delegation — not random local services." `
-            "whoami /all`nnltest /dsgetdc:$dns`ndir C:\Windows\SYSVOL 2>nul`n# On DC: enum domain carefully; local SYSTEM = domain compromise path later" `
-            "domain_is_dc"
-    } else {
-        Add-Finding MED "Domain-joined host: $dns (user $($ctx.User))" `
-            "Machine is domain-joined (not classified as DC). After local HIGH/MED, pivot to domain enum if local path is empty." `
-            "echo %USERDOMAIN% %USERDNSDOMAIN%`nnltest /dsgetdc:$dns`nnet time /domain`n# If hostname looks like a DC but this says no, check: reg query HKLM\SYSTEM\CurrentControlSet\Control\ProductOptions /v ProductType" `
-            "domain_joined"
-    }
-
-    # SYSVOL / NETLOGON reachability (always try when domain)
     $sysvolOk = $false
     $netlogonOk = $false
     try { if (Test-Path -LiteralPath $sysvol) { $sysvolOk = $true } } catch {}
     try { if (Test-Path -LiteralPath $netlogon) { $netlogonOk = $true } } catch {}
 
+    # GPP cpassword = always HIGH if found (quick probe, capped)
     if ($sysvolOk) {
-        Add-Finding MED "SYSVOL reachable: $sysvol  <-- prioritize domain file loot" `
-            "Best first domain step on many OSCP boxes: hunt GPO/scripts for passwords (Groups.xml cpassword, scripts, old configs). Do not full-recurse blindly if slow." `
-            "dir `"$sysvol`"`ndir `"$sysvol\$dns`"`ndir `"$sysvol\$dns\Policies`"`ndir `"$sysvol\$dns\scripts`"`ndir `"$netlogon`"`n# GPP (if present):`nfindstr /s /i /m cpassword `"$sysvol\*.xml`" 2>nul`nfindstr /s /i /m password `"$sysvol\*.xml`" `"$sysvol\*.ini`" `"$sysvol\*.bat`" `"$sysvol\*.ps1`" `"$sysvol\*.vbs`" 2>nul | more" `
-            "domain_sysvol"
-        # light GPP probe (already may have run in Test-PathAndAutorun; keep key if found)
         try {
             $gppHits = Get-ChildItem -Path $sysvol -Recurse -Include "Groups.xml","Services.xml","Scheduledtasks.xml","DataSources.xml","Drives.xml" -ErrorAction SilentlyContinue | Select-Object -First 20
             foreach ($f in $gppHits) {
                 $raw = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
                 if ($raw -match 'cpassword=') {
                     Add-Finding HIGH "GPP cpassword in SYSVOL: $($f.FullName)" `
-                        "Legacy Group Policy Preferences password. Decrypt offline (e.g. gpp-decrypt); script does not decrypt." `
+                        "Legacy Group Policy Preferences password. Decrypt offline; script does not decrypt." `
                         "type `"$($f.FullName)`"" `
-                        "gpp_sysvol:$($f.FullName)"
+                        "gpp_sysvol:$($f.FullName)" `
+                        -Priority 100
                 }
             }
         } catch {}
-    } elseif ($ctx.IsDomain) {
-        Add-Finding INFO "SYSVOL not reachable from here: $sysvol" `
-            "Try from another host or check DNS/name: \\$($ctx.NetBios)\SYSVOL" `
-            "dir `"$sysvol`"`ndir `"\\$($ctx.NetBios)\SYSVOL`"" `
-            "domain_sysvol_miss"
     }
 
-    if ($netlogonOk -and -not $sysvolOk) {
-        Add-Finding MED "NETLOGON reachable: $netlogon" `
-            "Logon scripts sometimes contain credentials or share paths." `
-            "dir `"$netlogon`"`ntype `"$netlogon\*.bat`" 2>nul`ntype `"$netlogon\*.cmd`" 2>nul`ntype `"$netlogon\*.vbs`" 2>nul" `
-            "domain_netlogon"
-    }
+    $role = if ($ctx.IsDC) { "Domain Controller ($($ctx.Computer)" + $(if ($ctx.DcHow) { "; $($ctx.DcHow)" } else { "" }) + ")" } else { "domain member ($($ctx.Computer))" }
+    $sysvolLine = if ($sysvolOk) { "SYSVOL=YES $sysvol" } else { "SYSVOL=NO (try \\$($ctx.NetBios)\SYSVOL)" }
+    $netLine = if ($netlogonOk) { "NETLOGON=YES $netlogon" } else { "NETLOGON=?" }
 
-    # No local HIGH => explicit "switch to domain" playbook (this is what confused users)
     if ($script:High -eq 0) {
-        $nl = [Environment]::NewLine
+        # Single top MED: role + playbook + SYSVOL commands (no separate duplicate findings)
         $play = @(
-            "# === DOMAIN PLAYBOOK (no local HIGH found) ===",
-            "# 1) Loot SYSVOL / NETLOGON for passwords and scripts",
+            "# === WHAT TO DO NOW (domain, no local HIGH) ===",
+            "# You are: $($ctx.User) on $role",
+            "# Shares: $sysvolLine | $netLine",
+            "#",
+            "# STEP 1 - Loot domain file shares (do this first)",
             "dir `"$sysvol`"",
+            "dir `"$sysvol\$dns`"",
+            "dir `"$sysvol\$dns\Policies`"",
+            "dir `"$sysvol\$dns\scripts`"",
             "dir `"$netlogon`"",
             "findstr /s /i /m cpassword `"$sysvol\*.xml`" 2>nul",
-            "findstr /s /i password `"$sysvol\*.xml`" `"$sysvol\*.bat`" `"$sysvol\*.ps1`" `"$netlogon\*.*`" 2>nul | more",
-            "# 2) Who am I in the domain?",
+            "findstr /s /i password `"$sysvol\*.xml`" `"$sysvol\*.bat`" `"$sysvol\*.ps1`" `"$sysvol\*.vbs`" `"$netlogon\*.*`" 2>nul | more",
+            "#",
+            "# STEP 2 - Domain identity / groups",
             "whoami /all",
             "net user $env:USERNAME /domain",
             "net group /domain",
             "net group `"Domain Admins`" /domain",
             "nltest /dclist:$dns",
             "nltest /dsgetdc:$dns",
-            "# 3) From attack host (only tools allowed in exam): BloodHound path to DA, kerberoast if in scope",
-            "# 4) If SeMachineAccountPrivilege enabled: review MachineAccountQuota / machine-account paths (manual)",
-            "# 5) After better domain creds, re-run local enum on new host/user"
+            "#",
+            "# STEP 3 - From attack host (exam-allowed tools only)",
+            "# BloodHound: path to Domain Admins",
+            "# Kerberoast / AS-REP if in scope",
+            "#",
+            "# STEP 4 - Privileges already noted (if any)",
+            "# SeMachineAccountPrivilege => machine account / quota paths (manual)",
+            "#",
+            "# STEP 5 - After new creds, re-run this script as better user/host"
         ) -join $nl
-        Add-Finding MED "NO local HIGH leads -> switch to DOMAIN enum now" `
-            "Local privesc has no high-confidence items. On domain boxes (esp. DCs) this is normal for a low-priv domain user. Stop grinding weak local noise; follow domain playbook (SYSVOL, users/groups, kerberos, ACLs)." `
+
+        Add-Finding MED "DOMAIN MODE: no local HIGH -> follow domain playbook" `
+            "Local high-confidence privesc not found. Host is $role; user $($ctx.User). This is common. Stop weak local noise; loot SYSVOL/NETLOGON then enum domain." `
             $play `
-            "domain_playbook_no_local_high"
+            "domain_playbook_no_local_high" `
+            -Priority 95
+
+        if (-not $sysvolOk) {
+            Add-Finding INFO "SYSVOL not reachable: $sysvol" `
+                "Playbook step 1 may fail until DNS/name works. Try NetBIOS path." `
+                "dir `"$sysvol`"`ndir `"\\$($ctx.NetBios)\SYSVOL`"" `
+                "domain_sysvol_miss" `
+                -Priority 40
+        }
     } else {
-        Add-Finding INFO "Domain context active; still verify local HIGH first" `
-            "You have local HIGH findings AND domain membership. Finish local HIGH, then domain loot/lateral." `
-            "whoami /all`ndir `"$sysvol`"" `
-            "domain_after_local_high"
+        # Have local HIGH: short domain note only, do not bury local leads
+        $short = @(
+            "dir `"$sysvol`"",
+            "dir `"$netlogon`"",
+            "findstr /s /i /m cpassword `"$sysvol\*.xml`" 2>nul",
+            "whoami /all",
+            "net user $env:USERNAME /domain"
+        ) -join $nl
+        Add-Finding MED "DOMAIN also in play: $role (finish local HIGH first)" `
+            "You have local HIGH findings. Verify those first, then domain loot/lateral. $sysvolLine" `
+            $short `
+            "domain_after_local_high" `
+            -Priority 30
     }
 }
 
@@ -651,10 +668,14 @@ function Test-IdentityAndTokens {
             "priv_managevolume"
     }
     if ($privText -match 'SeMachineAccountPrivilege\s+.*Enabled') {
-        Add-Finding MED "SeMachineAccountPrivilege = Enabled" `
-            "Can add machine accounts to the domain (ms-DS-MachineAccountQuota). Relevant for some AD attack chains (e.g. machine account / RBCD style paths). Manual only; confirm domain policy." `
-            "whoami /priv`nnet user /domain`n# Check MachineAccountQuota / domain attack notes for current exam rules" `
-            "priv_machineaccount"
+        # Only meaningful on domain; high priority so it sits under domain playbook
+        if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
+            Add-Finding MED "SeMachineAccountPrivilege = Enabled (domain-relevant)" `
+                "May add machine accounts if MachineAccountQuota allows. Used in some AD chains (machine account / RBCD-style). Manual only." `
+                "whoami /priv`nnet user /domain`n# Review MachineAccountQuota / exam notes before abusing machine accounts" `
+                "priv_machineaccount" `
+                -Priority 85
+        }
     }
 
     [void]$script:Details.Add("whoami:`n$who`n`nprivs:`n$privText`ngroups(admin-related):`n$(($groups | Select-String -Pattern 'Administrators|S-1-5-32|Label|Mandatory'))")
@@ -789,32 +810,41 @@ function Test-Services {
         $priv = Test-PrivilegedAccount $start
         $sysPath = Test-IsSystemPath $exe
 
-        # weak DACL
-        $daclIssue = Test-ServiceDaclWeak $name
-        if ($daclIssue) {
-            $sev = if ($priv) { "HIGH" } else { "MED" }
-            Add-Finding $sev "Weak service DACL: $name" `
-                "$daclIssue; StartName=$start State=$state. May allow service config change. Confirm with sc qc/sdshow; do NOT auto sc config." `
-                "sc qc $name`nsc sdshow $name`nsc qc $name" `
-                "svc_dacl:$name"
+        # Skip expensive sdshow + ACL on default Windows service binaries (speed + noise)
+        if ($sysPath -and -not (Test-UnquotedServicePath $raw)) { continue }
+
+        # weak DACL only for non-system paths or privileged start accounts outside System32
+        if (-not $sysPath) {
+            $daclIssue = Test-ServiceDaclWeak $name
+            if ($daclIssue) {
+                $sev = if ($priv) { "HIGH" } else { "MED" }
+                $prio = if ($priv) { 90 } else { 55 }
+                Add-Finding $sev "Weak service DACL: $name" `
+                    "$daclIssue; StartName=$start State=$state. May allow service config change. Confirm with sc qc/sdshow; do NOT auto sc config." `
+                    ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"") `
+                    "svc_dacl:$name" `
+                    -Priority $prio
+            }
         }
 
-        if ($exe -and (Test-Path -LiteralPath $exe)) {
+        if ($exe -and (Test-Path -LiteralPath $exe) -and -not $sysPath) {
             $dir = Split-Path -Parent $exe
-            if (-not $sysPath) {
-                if (Test-AclWritable $exe) {
-                    $sev = if ($priv) { "HIGH" } else { "MED" }
-                    Add-Finding $sev "Writable service binary: $exe" `
-                        "Service $name runs as $start ($state/$mode). Writable binary is high-confidence; need restart/start trigger." `
-                        ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$exe`"") `
-                        "svc_bin:$name"
-                } elseif ($dir -and (Test-AclWritable $dir)) {
-                    $sev = if ($priv) { "HIGH" } else { "MED" }
-                    Add-Finding $sev "Writable service directory: $dir" `
-                        "Service $name runs as $start. Common path: replace bin/DLL/config then trigger service." `
-                        ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$dir`"") `
-                        "svc_dir:$name"
-                }
+            if (Test-AclWritable $exe) {
+                $sev = if ($priv) { "HIGH" } else { "MED" }
+                $prio = if ($priv) { 92 } else { 55 }
+                Add-Finding $sev "Writable service binary: $exe" `
+                    "Service $name runs as $start ($state/$mode). Writable binary is high-confidence; need restart/start trigger." `
+                    ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$exe`"") `
+                    "svc_bin:$name" `
+                    -Priority $prio
+            } elseif ($dir -and (Test-AclWritable $dir)) {
+                $sev = if ($priv) { "HIGH" } else { "MED" }
+                $prio = if ($priv) { 91 } else { 55 }
+                Add-Finding $sev "Writable service directory: $dir" `
+                    "Service $name runs as $start. Common path: replace bin/DLL/config then trigger service." `
+                    ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$dir`"") `
+                    "svc_dir:$name" `
+                    -Priority $prio
             }
         }
 
@@ -824,15 +854,18 @@ function Test-Services {
             $prefix = Get-UnquotedWritablePrefix $exe2
             if ($prefix) {
                 $sev = if ($priv) { "HIGH" } else { "MED" }
+                $prio = if ($priv) { 88 } else { 55 }
                 Add-Finding $sev "Unquoted service path + writable prefix: $name" `
                     "Path=$raw; StartName=$start; WritablePrefix=$prefix. Confirm start/restart conditions." `
-                    "sc qc $name`nicacls `"$prefix`"" `
-                    "svc_uq:$name"
+                    ("sc qc `"$name`"" + [Environment]::NewLine + "icacls `"$prefix`"") `
+                    "svc_uq:$name" `
+                    -Priority $prio
             } elseif ($Mode -eq "full" -and -not $sysPath) {
                 Add-Finding INFO "Unquoted path (prefix not writable): $name" `
                     "Path=$raw. Not useful without write on a prefix." `
-                    "sc qc $name" `
-                    "svc_uq_info:$name"
+                    "sc qc `"$name`"" `
+                    "svc_uq_info:$name" `
+                    -Priority 20
             }
         }
     }
