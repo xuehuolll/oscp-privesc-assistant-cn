@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.1-en-ps"
+$Version = "1.9.2-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $Mode = if ($Full) { "full" } else { "summary" }
@@ -345,6 +345,7 @@ function Get-DomainContext {
     $ctx = [ordered]@{
         IsDomain = $false
         IsDC     = $false
+        DcHow    = ""
         NetBios  = $env:USERDOMAIN
         Dns      = $env:USERDNSDOMAIN
         Computer = $env:COMPUTERNAME
@@ -367,14 +368,71 @@ function Get-DomainContext {
         if ($null -ne $cs.DomainRole -and [int]$cs.DomainRole -ge 4) {
             $ctx.IsDC = $true
             $ctx.IsDomain = $true
+            $ctx.DcHow = "DomainRole=$($cs.DomainRole)"
         }
     } catch {
         try {
             $cs = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop
             if ($cs.PartOfDomain) { $ctx.IsDomain = $true; if ($cs.Domain) { $ctx.Dns = $cs.Domain } }
-            if ($null -ne $cs.DomainRole -and [int]$cs.DomainRole -ge 4) { $ctx.IsDC = $true; $ctx.IsDomain = $true }
+            if ($null -ne $cs.DomainRole -and [int]$cs.DomainRole -ge 4) {
+                $ctx.IsDC = $true
+                $ctx.IsDomain = $true
+                $ctx.DcHow = "DomainRole=$($cs.DomainRole)"
+            }
         } catch {}
     }
+
+    # Fallback DC signals (WMI often fails or lies under low priv / WinRM)
+    if (-not $ctx.IsDC) {
+        # ProductType: WinNT=workstation, ServerNT=member server, LanmanNT=domain controller
+        $pt = $null
+        try {
+            $pt = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions" -ErrorAction Stop).ProductType
+        } catch {}
+        if ($pt -eq "LanmanNT") {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+            $ctx.DcHow = "ProductType=LanmanNT"
+        }
+    }
+    if (-not $ctx.IsDC) {
+        # NTDS service present is a strong DC indicator
+        try {
+            $ntds = Get-Service -Name NTDS -ErrorAction SilentlyContinue
+            if ($ntds) {
+                $ctx.IsDC = $true
+                $ctx.IsDomain = $true
+                $ctx.DcHow = "Service=NTDS"
+            }
+        } catch {}
+    }
+    if (-not $ctx.IsDC) {
+        # Shared SYSVOL folder locally (DC hosts it)
+        if (Test-Path -LiteralPath "C:\Windows\SYSVOL\domain" -PathType Container -ErrorAction SilentlyContinue) {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+            $ctx.DcHow = "LocalPath=C:\Windows\SYSVOL\domain"
+        } elseif (Test-Path -LiteralPath "C:\Windows\SYSVOL\sysvol" -PathType Container -ErrorAction SilentlyContinue) {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+            $ctx.DcHow = "LocalPath=C:\Windows\SYSVOL\sysvol"
+        }
+    }
+    if (-not $ctx.IsDC -and $env:COMPUTERNAME -match '(?i)(^|-)DC\d*$|DC$|^DC') {
+        # Name heuristic only -> still mark DC candidate but weaker
+        $ctx.IsDC = $true
+        $ctx.IsDomain = $true
+        $ctx.DcHow = "HostnameHeuristic=$($env:COMPUTERNAME)"
+    }
+    if (-not $ctx.IsDC -and $env:LOGONSERVER) {
+        $ls = $env:LOGONSERVER.TrimStart('\').Trim()
+        if ($ls -and ($ls -ieq $env:COMPUTERNAME)) {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+            $ctx.DcHow = "LOGONSERVER=$ls"
+        }
+    }
+
     if (-not $ctx.Dns -and $ctx.IsDomain -and $ctx.NetBios) { $ctx.Dns = $ctx.NetBios }
     if ($env:LOGONSERVER) { $ctx.LogonServer = $env:LOGONSERVER.TrimStart('\') }
     return $ctx
@@ -390,14 +448,15 @@ function Complete-DomainGuidance {
     $netlogon = "\\$dns\NETLOGON"
 
     if ($ctx.IsDC) {
-        Add-Finding MED "Host appears to be a Domain Controller ($($ctx.Computer))" `
-            "You are on a DC as $($ctx.User). Local misconfig privesc is often sparse for domain users. Prefer AD/domain paths (creds in SYSVOL, ACLs, kerberos, delegation) over hunting random local services." `
-            "whoami /all`nnltest /dsgetdc:$dns`n# You are already on DC - protect OPSEC; enum domain objects carefully" `
+        $how = if ($ctx.DcHow) { " (detected via $($ctx.DcHow))" } else { "" }
+        Add-Finding MED "Host appears to be a Domain Controller: $($ctx.Computer)$how" `
+            "You are on a DC as $($ctx.User). Local misconfig privesc is often sparse for low-priv domain users. Prefer AD/domain paths: SYSVOL loot, user/group enum, kerberos, ACLs/delegation — not random local services." `
+            "whoami /all`nnltest /dsgetdc:$dns`ndir C:\Windows\SYSVOL 2>nul`n# On DC: enum domain carefully; local SYSTEM = domain compromise path later" `
             "domain_is_dc"
     } else {
         Add-Finding MED "Domain-joined host: $dns (user $($ctx.User))" `
-            "Machine is domain-joined. After local HIGH/MED, pivot to domain enum if local path is empty." `
-            "echo %USERDOMAIN% %USERDNSDOMAIN%`nnltest /dsgetdc:$dns`nnet time /domain" `
+            "Machine is domain-joined (not classified as DC). After local HIGH/MED, pivot to domain enum if local path is empty." `
+            "echo %USERDOMAIN% %USERDNSDOMAIN%`nnltest /dsgetdc:$dns`nnet time /domain`n# If hostname looks like a DC but this says no, check: reg query HKLM\SYSTEM\CurrentControlSet\Control\ProductOptions /v ProductType" `
             "domain_joined"
     }
 
