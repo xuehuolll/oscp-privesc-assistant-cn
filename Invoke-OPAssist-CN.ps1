@@ -21,7 +21,8 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.8.9-cn-ps"
+$Version = "1.9.0-en-ps"
+# English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
 if ($Report) { $NoColor = $true }
@@ -111,9 +112,9 @@ function Add-Finding {
 
 function Write-FindingObj($f) {
     $tag = switch ($f.Severity) {
-        "HIGH" { "!!! [高危/HIGH]" }
-        "MED"  { ">>> [中危/MED]" }
-        default { "--- [信息/INFO]" }
+        "HIGH" { "!!! [HIGH]" }
+        "MED"  { ">>> [MED]" }
+        default { "--- [INFO]" }
     }
     $color = switch ($f.Severity) {
         "HIGH" { "Red" }
@@ -122,9 +123,9 @@ function Write-FindingObj($f) {
     }
     if ($NoColor) { Write-Host "$tag $($f.Title)" }
     else { Write-Host "$tag $($f.Title)" -ForegroundColor $color }
-    if ($f.Reason) { Write-Host "    原因/Reason: $($f.Reason)" }
+    if ($f.Reason) { Write-Host "    Reason: $($f.Reason)" }
     if ($f.Next) {
-        Write-Host "    下一步/Next:"
+        Write-Host "    Next:"
         foreach ($line in ($f.Next -split "`n")) {
             if ($line.Trim()) { Write-Host "      $line" }
         }
@@ -140,14 +141,14 @@ function Write-FindingObj($f) {
 }
 
 function Print-Summary {
-    Section "优先级发现清单 / Priority Findings"
-    Write-Host "默认只显示能推进提权的证据 (privesc-only summary)。详情用 -Full。"
-    Write-Host "Default: privesc-advancing evidence only. Use -Full for raw dumps."
+    Section "Priority Findings"
+    Write-Host "Privesc-only summary (OSCP first pass). Use -Full for raw dumps."
+    Write-Host "English-only UI for WinRM/EN consoles. Manual verification only."
     Write-Host ""
 
     if ($script:Findings.Count -eq 0) {
-        Write-Host "未发现明确提权重点 / No clear high-value leads."
-        Write-Host "建议: whoami /priv, 手工查服务/任务 ACL, 或 WinPEAS/Seatbelt 作第二意见。"
+        Write-Host "No clear local privesc leads in summary filters."
+        Write-Host "Next: whoami /priv, review services/tasks ACLs, WinPEAS/Seatbelt, or domain enum (BloodHound)."
         return
     }
 
@@ -180,7 +181,7 @@ function Print-Summary {
     if ($Mode -ne "full" -and $script:Med -gt $script:MaxMedSummary) {
         $left = $script:Med - $script:MaxMedSummary
         if ($left -gt 0) {
-            Write-Host "[提示] $left 条中危已折叠，使用 -Full 查看 / $left MED folded; use -Full."
+            Write-Host "[tip] $left MED findings folded; use -Full."
         }
     }
 }
@@ -355,13 +356,13 @@ function Test-IdentityAndTokens {
     $grpText = ($groups | Out-String)
 
     if ($grpText -match 'S-1-5-32-544|Administrators') {
-        Add-Finding HIGH "当前用户可能已在本地 Administrators 组" `
-            "若令牌有效则接近管理员；远程 shell 仍可能是过滤管理员令牌 (UAC)。" `
-            "whoami /groups`nwhoami /priv`nwhoami /all`nnet localgroup administrators`n# 若 Filtered: 需要 UAC bypass 或另找完整高权进程" `
+        Add-Finding HIGH "User may be in local Administrators" `
+            "If token is full admin, you may already have admin rights. Remote shells are often UAC-filtered." `
+            "whoami /groups`nwhoami /priv`nwhoami /all`nnet localgroup administrators`n# If filtered admin: need another path or UAC bypass (manual)" `
             "admin_group"
     }
 
-    # interesting groups
+    # Privesc-relevant groups only. RDP/WinRM membership is access method, not local privesc.
     $interesting = @{
         "S-1-5-32-551" = "Backup Operators"
         "S-1-5-32-550" = "Print Operators"
@@ -369,8 +370,6 @@ function Test-IdentityAndTokens {
         "S-1-5-32-548" = "Account Operators"
         "S-1-5-32-552" = "Replicator"
         "S-1-5-32-578" = "Hyper-V Administrators"
-        "S-1-5-32-580" = "Remote Management Users"
-        "S-1-5-32-555" = "Remote Desktop Users"
         "S-1-5-32-562" = "Distributed COM Users"
     }
     foreach ($sid in $interesting.Keys) {
@@ -378,60 +377,75 @@ function Test-IdentityAndTokens {
         if ($grpText -match [regex]::Escape($sid) -or $grpText -match [regex]::Escape($gname)) {
             $sev = if ($sid -in @("S-1-5-32-551","S-1-5-32-549","S-1-5-32-548","S-1-5-32-578")) { "HIGH" } else { "MED" }
             $gnext = "whoami /groups" + [Environment]::NewLine + "net localgroup `"$gname`""
-            Add-Finding $sev "敏感组/Sensitive group: $gname" `
-                "该组常有专用提权/横向手法。对照 HackTricks 手工验证。 / Often has dedicated privesc paths." `
+            Add-Finding $sev "Interesting group: $gname" `
+                "Often has dedicated privesc techniques. Check HackTricks for this group (manual)." `
                 $gnext `
                 "group_$sid"
+        }
+    }
+    # Access groups: only note in -Full (noise on Evil-WinRM/RDP shells)
+    if ($Mode -eq "full") {
+        if ($grpText -match 'S-1-5-32-580|Remote Management Users') {
+            Add-Finding INFO "Group: Remote Management Users" "Explains WinRM access; not a local privesc by itself." "whoami /groups" "group_winrm"
+        }
+        if ($grpText -match 'S-1-5-32-555|Remote Desktop Users') {
+            Add-Finding INFO "Group: Remote Desktop Users" "Explains RDP access; not a local privesc by itself." "whoami /groups" "group_rdp"
         }
     }
 
     if ($privText -match 'SeImpersonatePrivilege\s+.*Enabled') {
         Add-Finding HIGH "SeImpersonatePrivilege = Enabled" `
-            "高价值令牌权限。OSCP 常见土豆类/PrintSpoofer 等场景，但必须结合系统版本、服务与考试规则手工选择手法，脚本不自动利用。" `
-            "whoami /priv`nsysteminfo`ntasklist /v`n# 确认 build + 可用服务后，再手工选兼容工具" `
+            "High-value. Potato/PrintSpoofer-class paths depend on OS build and services. Script does NOT exploit." `
+            "whoami /priv`nsysteminfo`ntasklist /v`n# Confirm build + service context, then choose a technique manually" `
             "priv_impersonate"
     }
     if ($privText -match 'SeAssignPrimaryTokenPrivilege\s+.*Enabled') {
         Add-Finding HIGH "SeAssignPrimaryTokenPrivilege = Enabled" `
-            "与 impersonation 类似的高价值权限。" `
+            "High-value token privilege (similar class to impersonation)." `
             "whoami /priv`nsysteminfo" `
             "priv_assign"
     }
     if ($privText -match 'SeBackupPrivilege\s+.*Enabled') {
         Add-Finding HIGH "SeBackupPrivilege = Enabled" `
-            "可能以备份语义读敏感文件/注册表。reg save 会写盘，仅手工、确认环境后操作。" `
+            "May read sensitive files/registry via backup semantics. reg save writes disk - manual only." `
             "whoami /priv`ndir C:\Windows\Repair 2>`$null`ndir C:\Windows\System32\config\RegBack`nicacls C:\Windows\System32\config\SAM" `
             "priv_backup"
     }
     if ($privText -match 'SeRestorePrivilege\s+.*Enabled') {
         Add-Finding HIGH "SeRestorePrivilege = Enabled" `
-            "恢复类权限可能写敏感位置；只做授权环境手工验证。" `
+            "Restore-class privilege; manual verification only." `
             "whoami /priv" `
             "priv_restore"
     }
     if ($privText -match 'SeDebugPrivilege\s+.*Enabled') {
         Add-Finding HIGH "SeDebugPrivilege = Enabled" `
-            "可能调试高权限进程/读内存。高价值线索。" `
+            "May debug privileged processes / read memory." `
             "whoami /priv`ntasklist /v" `
             "priv_debug"
     }
     if ($privText -match 'SeTakeOwnershipPrivilege\s+.*Enabled') {
         Add-Finding MED "SeTakeOwnershipPrivilege = Enabled" `
-            "特定 ACL 场景有用，通常不是第一路径。" `
+            "Useful in some ACL cases; rarely first path." `
             "whoami /priv" `
             "priv_takeown"
     }
     if ($privText -match 'SeLoadDriverPrivilege\s+.*Enabled') {
         Add-Finding MED "SeLoadDriverPrivilege = Enabled" `
-            "加载驱动相关；OSCP 中较少作为第一路径。" `
+            "Driver-load related; rarely first OSCP path." `
             "whoami /priv" `
             "priv_loaddriver"
     }
     if ($privText -match 'SeManageVolumePrivilege\s+.*Enabled') {
         Add-Finding MED "SeManageVolumePrivilege = Enabled" `
-            "卷管理相关，特定手法可能读磁盘。" `
+            "Volume management; niche disk-read techniques exist." `
             "whoami /priv" `
             "priv_managevolume"
+    }
+    if ($privText -match 'SeMachineAccountPrivilege\s+.*Enabled') {
+        Add-Finding MED "SeMachineAccountPrivilege = Enabled" `
+            "Can add machine accounts to the domain (ms-DS-MachineAccountQuota). Relevant for some AD attack chains (e.g. machine account / RBCD style paths). Manual only; confirm domain policy." `
+            "whoami /priv`nnet user /domain`n# Check MachineAccountQuota / domain attack notes for current exam rules" `
+            "priv_machineaccount"
     }
 
     [void]$script:Details.Add("whoami:`n$who`n`nprivs:`n$privText`ngroups(admin-related):`n$(($groups | Select-String -Pattern 'Administrators|S-1-5-32|Label|Mandatory'))")
@@ -443,21 +457,21 @@ function Test-ClassicMisconfigs {
     $hkcuOn = ($hkcu | Out-String) -match '0x1'
     $hklmOn = ($hklm | Out-String) -match '0x1'
     if ($hkcuOn -and $hklmOn) {
-        Add-Finding HIGH "AlwaysInstallElevated 同时在 HKCU/HKLM 启用" `
-            "经典 MSI 本地提权配置错误。利用前确认考试规则；脚本不生成/安装 MSI。" `
+        Add-Finding HIGH "AlwaysInstallElevated enabled (HKCU+HKLM)" `
+            "Classic MSI local privesc misconfig. Do not auto-build/install MSI; manual only per exam rules." `
             "reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated`nreg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated" `
             "aie"
     } elseif ($hkcuOn -or $hklmOn) {
-        Add-Finding INFO "AlwaysInstallElevated 仅单边启用 (不足)" `
-            "需要 HKCU 与 HKLM 同时为 1 才经典可利用。" `
-            "reg query HKCU\...\AlwaysInstallElevated`nreg query HKLM\...\AlwaysInstallElevated" `
+        Add-Finding INFO "AlwaysInstallElevated only one-sided" `
+            "Both HKCU and HKLM must be 1 for classic abuse." `
+            "reg query HKCU\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated`nreg query HKLM\Software\Policies\Microsoft\Windows\Installer /v AlwaysInstallElevated" `
             "aie_partial"
     }
 
     $winlogon = reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" 2>$null
     if (($winlogon | Out-String) -match 'DefaultPassword') {
-        Add-Finding HIGH "Winlogon AutoLogon 可能含明文密码" `
-            "DefaultPassword/DefaultUserName 常可直接复用。" `
+        Add-Finding HIGH "Winlogon AutoLogon may store cleartext password" `
+            "DefaultPassword/DefaultUserName often reusable." `
             "reg query `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`"`ncmdkey /list`nnet user" `
             "autologon"
     }
@@ -474,36 +488,44 @@ function Test-ClassicMisconfigs {
     )
     foreach ($p in $unattend) {
         if (Test-Path -LiteralPath $p) {
-            Add-Finding HIGH "发现 Unattend/Sysprep: $p" `
-                "历史上常残留本地管理员或域账号密码。" `
+            Add-Finding HIGH "Unattend/Sysprep found: $p" `
+                "Historically often contains local admin or domain passwords." `
                 "dir `"$p`"`nfindstr /ni /i `"password administrator username domain`" `"$p`"" `
                 "unattend:$p"
         }
     }
 
+    # Only report SAM/SYSTEM backups that are REALLY readable and non-empty.
+    # Mere existence of RegBack stubs is extremely common and not a lead.
     $sam = @(
         "C:\Windows\Repair\SAM","C:\Windows\Repair\SYSTEM","C:\Windows\Repair\SECURITY",
-        "C:\Windows\System32\config\RegBack\SAM","C:\Windows\System32\config\RegBack\SYSTEM","C:\Windows\System32\config\RegBack\SECURITY",
-        "C:\Windows\System32\config\RegBack\DEFAULT"
+        "C:\Windows\System32\config\RegBack\SAM","C:\Windows\System32\config\RegBack\SYSTEM","C:\Windows\System32\config\RegBack\SECURITY"
     )
     foreach ($p in $sam) {
-        if (Test-Path -LiteralPath $p) {
-            $readable = $false
-            try {
-                $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
-                $fs.Close(); $readable = $true
-            } catch { $readable = $false }
-            if ($readable) {
-                Add-Finding HIGH "可读 SAM/SYSTEM 备份: $p" `
-                    "当前用户似乎可读。可 copy 到可写目录后离线提取哈希 (手工)。" `
-                    "dir `"$p`"`nicacls `"$p`"`n# copy to writable dir then offline parse" `
-                    "sam_read:$p"
-            } else {
-                Add-Finding MED "存在 SAM/SYSTEM 备份路径: $p" `
-                    "文件在，但当前可能不可读。若有 SeBackup 等权限可另法读取。" `
-                    "dir `"$p`"`nicacls `"$p`"" `
-                    "sam_exist:$p"
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $len = 0
+        try { $len = (Get-Item -LiteralPath $p -ErrorAction Stop).Length } catch { $len = 0 }
+        if ($len -lt 16) {
+            if ($Mode -eq "full") {
+                Add-Finding INFO "SAM/SYSTEM path exists but empty/tiny: $p" "Common RegBack stub; not useful alone." "dir `"$p`"" "sam_empty:$p"
             }
+            continue
+        }
+        $readable = $false
+        try {
+            $fs = [System.IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+            $fs.Close(); $readable = $true
+        } catch { $readable = $false }
+        if ($readable) {
+            Add-Finding HIGH "Readable SAM/SYSTEM backup: $p (size=$len)" `
+                "Looks readable. Copy offline and extract hashes manually." `
+                "dir `"$p`"`nicacls `"$p`"`n# copy to writable dir then offline parse" `
+                "sam_read:$p"
+        } elseif ($Mode -eq "full") {
+            Add-Finding INFO "SAM/SYSTEM backup present but not readable: $p" `
+                "Only interesting with SeBackup or other read path." `
+                "dir `"$p`"`nicacls `"$p`"" `
+                "sam_exist:$p"
         }
     }
 }
@@ -541,7 +563,7 @@ function Test-Services {
         try { $services = Get-WmiObject Win32_Service -ErrorAction Stop } catch { $services = @() }
     }
     if (-not $services) {
-        Add-Finding INFO "无法枚举服务 (WMI/CIM 失败)" "可手工 sc query state= all" "sc query state= all" "svc_enum_fail"
+        Add-Finding INFO "Cannot enumerate services (WMI/CIM failed)" "Try: sc query state= all" "sc query state= all" "svc_enum_fail"
         return
     }
 
@@ -562,8 +584,8 @@ function Test-Services {
         $daclIssue = Test-ServiceDaclWeak $name
         if ($daclIssue) {
             $sev = if ($priv) { "HIGH" } else { "MED" }
-            Add-Finding $sev "服务 DACL 可能过弱: $name" `
-                "$daclIssue; StartName=$start State=$state。可能允许修改服务配置。请用 sc qc/sdshow 手工确认，勿自动 sc config。" `
+            Add-Finding $sev "Weak service DACL: $name" `
+                "$daclIssue; StartName=$start State=$state. May allow service config change. Confirm with sc qc/sdshow; do NOT auto sc config." `
                 "sc qc $name`nsc sdshow $name`nsc qc $name" `
                 "svc_dacl:$name"
         }
@@ -573,14 +595,14 @@ function Test-Services {
             if (-not $sysPath) {
                 if (Test-AclWritable $exe) {
                     $sev = if ($priv) { "HIGH" } else { "MED" }
-                    Add-Finding $sev "服务二进制当前用户可写: $exe" `
-                        "服务 $name 以 $start 运行 ($state/$mode)。可写二进制是高确定性线索；需能触发重启/启动。" `
+                    Add-Finding $sev "Writable service binary: $exe" `
+                        "Service $name runs as $start ($state/$mode). Writable binary is high-confidence; need restart/start trigger." `
                         ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$exe`"") `
                         "svc_bin:$name"
                 } elseif ($dir -and (Test-AclWritable $dir)) {
                     $sev = if ($priv) { "HIGH" } else { "MED" }
-                    Add-Finding $sev "服务目录当前用户可写: $dir" `
-                        "服务 $name 以 $start 运行。OSCP 常见: 替换二进制/DLL/配置后触发服务。" `
+                    Add-Finding $sev "Writable service directory: $dir" `
+                        "Service $name runs as $start. Common path: replace bin/DLL/config then trigger service." `
                         ("sc qc `"$name`"" + [Environment]::NewLine + "sc sdshow `"$name`"" + [Environment]::NewLine + "icacls `"$dir`"") `
                         "svc_dir:$name"
                 }
@@ -593,13 +615,13 @@ function Test-Services {
             $prefix = Get-UnquotedWritablePrefix $exe2
             if ($prefix) {
                 $sev = if ($priv) { "HIGH" } else { "MED" }
-                Add-Finding $sev "未加引号服务路径 + 可写中间目录: $name" `
-                    "Path=$raw; StartName=$start; WritablePrefix=$prefix。仍需确认服务启动/重启条件。" `
+                Add-Finding $sev "Unquoted service path + writable prefix: $name" `
+                    "Path=$raw; StartName=$start; WritablePrefix=$prefix. Confirm start/restart conditions." `
                     "sc qc $name`nicacls `"$prefix`"" `
                     "svc_uq:$name"
             } elseif ($Mode -eq "full" -and -not $sysPath) {
-                Add-Finding INFO "未加引号服务路径 (中间目录当前不可写): $name" `
-                    "Path=$raw。无写权限通常不可利用。" `
+                Add-Finding INFO "Unquoted path (prefix not writable): $name" `
+                    "Path=$raw. Not useful without write on a prefix." `
                     "sc qc $name" `
                     "svc_uq_info:$name"
             }
@@ -632,24 +654,24 @@ function Test-ScheduledTasks {
                     if ($path) {
                         $dir = Split-Path -Parent $path
                         if ((Test-Path -LiteralPath $path) -and (Test-AclWritable $path)) {
-                            Add-Finding HIGH "高权限计划任务执行文件可写: $path" `
+                            Add-Finding HIGH "Writable privileged scheduled-task binary: $path" `
                                 "Task=$tname RunAs=$runAs" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v`nicacls `"$path`"" `
                                 "task_file:$tname"
                         } elseif ($dir -and (Test-Path -LiteralPath $dir) -and (Test-AclWritable $dir)) {
-                            Add-Finding HIGH "高权限计划任务目录可写: $dir" `
+                            Add-Finding HIGH "Writable privileged scheduled-task directory: $dir" `
                                 "Task=$tname RunAs=$runAs Cmd=$toRun" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v`nicacls `"$dir`"" `
                                 "task_dir:$tname"
                         } elseif ($path -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\inetpub\\|\\xampp\\') {
-                            Add-Finding MED "高权限计划任务指向非标准路径: $path" `
+                            Add-Finding MED "Privileged task points to non-standard path: $path" `
                                 "Task=$tname RunAs=$runAs" `
                                 "schtasks /query /tn `"$tname`" /fo LIST /v" `
                                 "task_ns:$tname"
                         }
                     } elseif ($toRun -match '(?i)powershell|cmd\.exe|wscript|cscript|\.bat|\.cmd|\.ps1|\.vbs') {
-                        Add-Finding MED "高权限计划任务执行脚本/解释器: $tname" `
-                            "RunAs=$runAs Cmd=$toRun。请手工提取脚本路径与 ACL。" `
+                        Add-Finding MED "Privileged task runs script/interpreter: $tname" `
+                            "RunAs=$runAs Cmd=$toRun. Extract script path and check ACL manually." `
                             "schtasks /query /tn `"$tname`" /fo LIST /v" `
                             "task_script:$tname"
                     }
@@ -683,8 +705,8 @@ function Test-ScheduledTasks {
                 $taskFile = $taskFile -replace '\\+','\'
                 if (Test-Path -LiteralPath $taskFile -PathType Leaf) {
                     if (Test-AclWritable $taskFile) {
-                        Add-Finding HIGH "计划任务定义文件可写: $taskFile" `
-                            "Task=$fullName RunAs=$runAs。可写任务 XML 是高价值线索。" `
+                        Add-Finding HIGH "Writable scheduled task definition: $taskFile" `
+                            "Task=$fullName RunAs=$runAs. Writable task XML is high-value." `
                             "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v`nicacls `"$taskFile`"" `
                             "task_xml:$fullName"
                     }
@@ -695,23 +717,23 @@ function Test-ScheduledTasks {
                 if ($path -and (Test-Path -LiteralPath $path)) {
                     $dir = Split-Path -Parent $path
                     if (Test-AclWritable $path) {
-                        Add-Finding HIGH "高权限计划任务执行文件可写: $path" `
+                        Add-Finding HIGH "Writable privileged scheduled-task binary: $path" `
                             "Task=$fullName RunAs=$runAs" `
                             "Get-ScheduledTask -TaskName '$($t.TaskName)' | fl *`nicacls `"$path`"" `
                             "task_bin:$fullName"
                     } elseif ($dir -and (Test-AclWritable $dir)) {
-                        Add-Finding HIGH "高权限计划任务目录可写: $dir" `
+                        Add-Finding HIGH "Writable privileged scheduled-task directory: $dir" `
                             "Task=$fullName RunAs=$runAs Cmd=$cmd" `
                             "icacls `"$dir`"`ndir `"$dir`"" `
                             "task_dir2:$fullName"
                     }
                 } elseif ($path -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\inetpub\\') {
-                    Add-Finding MED "高权限计划任务非标准路径: $path" `
+                    Add-Finding MED "Privileged task non-standard path: $path" `
                         "Task=$fullName RunAs=$runAs" `
                         "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v" `
                         "task_ns2:$fullName"
                 } elseif ($cmd -match '(?i)powershell|cmd\.exe|wscript|cscript|\.ps1|\.bat') {
-                    Add-Finding MED "高权限计划任务脚本/解释器: $fullName" `
+                    Add-Finding MED "Privileged task script/interpreter: $fullName" `
                         "RunAs=$runAs Cmd=$cmd" `
                         "schtasks /query /tn `"$($t.TaskName)`" /fo LIST /v" `
                         "task_sc2:$fullName"
@@ -722,23 +744,27 @@ function Test-ScheduledTasks {
 }
 
 function Test-PathAndAutorun {
-    # PATH hijack
+    # PATH hijack - skip always-writable user noise (WindowsApps, profile dirs)
     $pathWritten = 0
     foreach ($d in ($env:Path -split ';' | Where-Object { $_ })) {
         if ($d -match '^\\\\') { continue } # UNC skip
         if (-not (Test-Path -LiteralPath $d)) { continue }
+        # Noise filters: default user-writable locations rarely help local privesc
+        if ($d -match '(?i)\\WindowsApps$|\\AppData\\Local\\Microsoft\\WindowsApps') { continue }
+        if ($env:USERPROFILE -and ($d.StartsWith($env:USERPROFILE, [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+        if ($env:TEMP -and ($d.StartsWith($env:TEMP, [System.StringComparison]::OrdinalIgnoreCase))) { continue }
         if (Test-AclWritable $d) {
             $pathWritten++
             if ($pathWritten -le 4) {
-                Add-Finding MED "PATH 目录当前用户可写: $d" `
-                    "仅当高权限程序以相对命令名启动并继承该 PATH 时才有用。优先对照服务/任务。" `
+                Add-Finding MED "Writable PATH directory: $d" `
+                    "Only useful if a privileged process starts a relative command with this PATH." `
                     "echo `$env:Path`nicacls `"$d`"" `
                     "path:$d"
             }
         }
     }
     if ($pathWritten -gt 4) {
-        Add-Finding INFO "更多可写 PATH 目录" "约 $pathWritten 个；summary 只显示前 4。" "echo `$env:Path" "path_more"
+        Add-Finding INFO "More writable PATH dirs" "About $pathWritten; summary shows first 4." "echo `$env:Path" "path_more"
     }
 
     # Run keys
@@ -754,8 +780,8 @@ function Test-PathAndAutorun {
             $val = [string]$p.Value
             if ($val -match '(?i)\\Users\\|\\Temp\\|\\ProgramData\\|\\AppData\\') {
                 $sev = if ($root -match 'HKLM') { "MED" } else { "INFO" }
-                Add-Finding $sev "Run 键指向用户/临时类路径: $root\$($p.Name)" `
-                    "Value=$val。检查目标 ACL 是否可写。" `
+                Add-Finding $sev "Run key points to user/temp-like path: $root\$($p.Name)" `
+                    "Value=$val. Check if target path is writable." `
                     "reg query $($root -replace ':','')`nicacls (extract path from value)" `
                     "run:$root`:$($p.Name)"
             }
@@ -764,7 +790,7 @@ function Test-PathAndAutorun {
                 $dir = Split-Path -Parent $exe
                 if ((Test-AclWritable $exe) -or ($dir -and (Test-AclWritable $dir))) {
                     $sev = if ($root -match 'HKLM') { "HIGH" } else { "MED" }
-                    Add-Finding $sev "Run 键目标可写: $exe" `
+                    Add-Finding $sev "Writable Run key target: $exe" `
                         "Key=$root Name=$($p.Name) Value=$val" `
                         "icacls `"$exe`"" `
                         "run_wr:$root`:$($p.Name)"
@@ -783,12 +809,12 @@ function Test-PathAndAutorun {
         $items = Get-ChildItem -LiteralPath $s -Force -ErrorAction SilentlyContinue
         if (Test-AclWritable $s) {
             $sev = if ($s -match 'ProgramData') { "HIGH" } else { "MED" }
-            Add-Finding $sev "Startup 目录可写: $s" `
-                "可写启动目录可能影响登录启动项。" `
+            Add-Finding $sev "Writable Startup folder: $s" `
+                "Writable startup may affect logon items." `
                 "dir /a `"$s`"`nicacls `"$s`"" `
                 "startup:$s"
         } elseif ($items) {
-            Add-Finding INFO "Startup 目录非空: $s" "检查内容与 ACL。" "dir /a `"$s`"" "startup_info:$s"
+            Add-Finding INFO "Startup folder non-empty: $s" "Review contents and ACLs." "dir /a `"$s`"" "startup_info:$s"
         }
     }
 
@@ -802,8 +828,8 @@ function Test-PathAndAutorun {
         if (Test-Path -LiteralPath $g) {
             $files = Get-ChildItem -LiteralPath $g -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 20
             if ($files) {
-                Add-Finding MED "发现本地 GPO 脚本目录: $g" `
-                    "检查 scripts/scripts.ini 与脚本 ACL；域 GPO 也可能在 SYSVOL (需域可读)。" `
+                Add-Finding MED "Local GPO scripts directory: $g" `
+                    "Check scripts/scripts.ini and ACLs. Domain GPOs also live under SYSVOL if readable." `
                     "dir /s `"$g`"`n# also: dir \\$env:USERDNSDOMAIN\SYSVOL 2>nul" `
                     "gpo:$g"
             }
@@ -812,8 +838,8 @@ function Test-PathAndAutorun {
     if ($env:USERDNSDOMAIN) {
         $sysvol = "\\$($env:USERDNSDOMAIN)\SYSVOL"
         if (Test-Path $sysvol) {
-            Add-Finding MED "SYSVOL 可读: $sysvol" `
-                "域脚本/GPO 可能含凭据或可写脚本路径。请手工枚举，注意噪音与时间。" `
+            Add-Finding MED "SYSVOL readable: $sysvol" `
+                "Domain scripts/GPO may hold creds or writable scripts. Enumerate carefully (can be noisy/slow)." `
                 "dir `"$sysvol`"`n# look for scripts, Registry.xml, Groups.xml (GPP)" `
                 "sysvol"
             # GPP cpassword classic (often patched but still check)
@@ -822,8 +848,8 @@ function Test-PathAndAutorun {
                 foreach ($f in $gpp) {
                     $raw = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
                     if ($raw -match 'cpassword=') {
-                        Add-Finding HIGH "GPP 可能含 cpassword: $($f.FullName)" `
-                            "历史 GPP 凭据。可手工解密；脚本不自动解密利用。" `
+                        Add-Finding HIGH "GPP may contain cpassword: $($f.FullName)" `
+                            "Legacy GPP credentials. Decrypt manually; script does not decrypt/use them." `
                             "type `"$($f.FullName)`"`n# find cpassword= ..." `
                             "gpp:$($f.FullName)"
                     }
@@ -846,8 +872,8 @@ function Test-Credentials {
         if (-not (Test-Path -LiteralPath $h)) { continue }
         $hit = Select-String -Path $h -Pattern 'password|passwd|pwd|credential|cmdkey|runas|net use|sqlcmd|ConvertTo-SecureString|ssh |winrm' -SimpleMatch:$false -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($hit) {
-            Add-Finding HIGH "PowerShell 历史含凭据/登录线索" `
-                "File=$h 命中: $($hit.Line.Trim())" `
+            Add-Finding HIGH "PowerShell history has credential-like keywords" `
+                "File=$h hit: $($hit.Line.Trim())" `
                 "type `"$h`"`nfindstr /ni /i `"password passwd pwd credential cmdkey runas`" `"$h`"" `
                 "pshist:$h"
         }
@@ -856,8 +882,8 @@ function Test-Credentials {
     # cmdkey
     $ck = cmdkey /list 2>$null | Out-String
     if ($ck -match 'Target:') {
-        Add-Finding MED "存在 Windows 保存凭据 (cmdkey)" `
-            "是否可用取决于目标类型与上下文。不要自动 runas。" `
+        Add-Finding MED "Saved credentials present (cmdkey)" `
+            "Usability depends on target type/context. Do not auto runas." `
             "cmdkey /list" `
             "cmdkey"
     }
@@ -875,16 +901,16 @@ function Test-Credentials {
     )
     foreach ($f in $clients) {
         if ($f -and (Test-Path -LiteralPath $f)) {
-            Add-Finding MED "客户端凭据配置: $f" `
-                "可能含主机/用户/保存密码。" `
+            Add-Finding MED "Client credential config: $f" `
+                "May contain host/user/saved password." `
                 "dir `"$f`"`nfindstr /ni /i `"password pass user host key`" `"$f`"" `
                 "client:$f"
         }
     }
 
     if (Test-Path "HKCU:\Software\SimonTatham\PuTTY\Sessions") {
-        Add-Finding MED "发现 PuTTY Sessions" `
-            "HostName/UserName/PublicKeyFile 常有横向价值。" `
+        Add-Finding MED "PuTTY sessions found" `
+            "HostName/UserName/PublicKeyFile often useful for lateral movement." `
             "reg query `"HKCU\Software\SimonTatham\PuTTY\Sessions`" /s" `
             "putty"
     }
@@ -904,8 +930,8 @@ function Test-Credentials {
             if (Test-StrongCredContent $c.FullName) {
                 $script:CredHits++
                 $sev = if ($c.Name -match 'web\.config|\.env|appsettings') { "HIGH" } else { "MED" }
-                Add-Finding $sev "配置疑似真实凭据赋值: $($c.FullName)" `
-                    "命中 password=/connectionString/token 等强特征。报告勿粘贴明文。" `
+                Add-Finding $sev "Config looks like real credential assignment: $($c.FullName)" `
+                    "Hit password=/connectionString/token-like values. Do not paste secrets into reports." `
                     "dir `"$($c.FullName)`"`nfindstr /ni /i `"password passwd pwd connectionString secret token`" `"$($c.FullName)`"" `
                     "cred:$($c.FullName)"
             }
@@ -920,8 +946,8 @@ function Test-Credentials {
     )
     foreach ($v in $vnc) {
         if (Test-Path $v) {
-            Add-Finding MED "发现 VNC 相关注册表: $v" `
-                "可能含 Password 等字段。" `
+            Add-Finding MED "VNC-related registry: $v" `
+                "May contain Password fields." `
                 "reg query $($v -replace ':','') /s" `
                 "vnc:$v"
         }
@@ -930,7 +956,8 @@ function Test-Credentials {
 
 function Test-LocalPorts {
     $net = netstat -ano 2>$null | Out-String
-    $interesting = @(3306,5432,6379,27017,1433,8080,8000,5000,9200,5985,5986,445,139)
+    # Loopback DB/admin only. Exclude 445/139 (SMB noise) and general WinRM unless full.
+    $interesting = @(3306,5432,6379,27017,1433,8080,8000,5000,9200,8443,11211)
     $hits = @()
     foreach ($port in $interesting) {
         if ($net -match "127\.0\.0\.1:$port\s" -or $net -match "\[::1\]:$port\s") {
@@ -938,12 +965,15 @@ function Test-LocalPorts {
         }
     }
     if ($hits.Count -gt 0) {
-        Add-Finding MED "本机回环高价值端口: $($hits -join ', ')" `
-            "本地 DB/WinRM/管理服务常见路径: 配置找账密 → 本地连接/复用。" `
+        Add-Finding MED "Interesting localhost listeners: $($hits -join ', ')" `
+            "Local DB/admin services often pair with app config credentials." `
             "netstat -ano | findstr LISTENING`nnetstat -ano | findstr 127.0.0.1" `
             "ports"
     }
     if ($Mode -eq "full") {
+        if ($net -match "127\.0\.0\.1:5985\s" -or $net -match "127\.0\.0\.1:5986\s") {
+            Add-Finding INFO "WinRM listening on localhost" "Expected on many boxes; not a privesc by itself." "netstat -ano | findstr 5985" "ports_winrm"
+        }
         [void]$script:Details.Add("netstat LISTENING:`n" + (($net -split "`n" | Select-String LISTENING | Select-Object -First 80) -join "`n"))
     }
 }
@@ -952,8 +982,8 @@ function Test-EnvHints {
     try {
         $lm = $ExecutionContext.SessionState.LanguageMode
         if ($lm -ne "FullLanguage") {
-            Add-Finding MED "PowerShell 语言模式受限: $lm" `
-                "ConstrainedLanguage 等可能限制脚本/cmdlet。优先用 cmd 内置命令验证。" `
+            Add-Finding MED "PowerShell language mode restricted: $lm" `
+                "ConstrainedLanguage may block cmdlets. Prefer built-in cmd commands." `
                 "`$ExecutionContext.SessionState.LanguageMode`nwhoami /priv" `
                 "langmode"
         }
@@ -966,8 +996,8 @@ function Test-EnvHints {
             $consent = $uac.ConsentPromptBehaviorAdmin
             $enableLua = $uac.EnableLUA
             if ($Mode -eq "full") {
-                Add-Finding INFO "UAC 策略 EnableLUA=$enableLua ConsentPromptBehaviorAdmin=$consent" `
-                    "影响提权后令牌与提权体验；不是直接漏洞。" `
+                Add-Finding INFO "UAC policy EnableLUA=$enableLua ConsentPromptBehaviorAdmin=$consent" `
+                    "Affects elevation/token filtering; not a vulnerability by itself." `
                     "reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
                     "uac"
             }
@@ -975,30 +1005,30 @@ function Test-EnvHints {
     } catch {}
 
     if ($env:USERDOMAIN -and $env:COMPUTERNAME -and ($env:USERDOMAIN -ne $env:COMPUTERNAME)) {
-        Add-Finding INFO "可能处于域环境: $env:USERDOMAIN" `
-            "提权后关注横向；本脚本不做大规模 AD 攻击枚举。" `
-            "whoami /fqdn`nnet user /domain`nnet group `"Domain Admins`" /domain" `
+        Add-Finding INFO "Domain context: $env:USERDOMAIN" `
+            "Domain user on workstation/DC. After local enum, pivot to AD enum (BloodHound, kerberoast, etc.). This script stays local-focused." `
+            "whoami /fqdn`nnet user /domain`nnet group `"Domain Admins`" /domain`nnltest /dclist:" `
             "domain"
     }
 
     # service account profile lite
     if ("$env:USERDOMAIN\$env:USERNAME" -match 'IIS APPPOOL|IUSR') {
-        Add-Finding MED "当前身份疑似 IIS 应用池/Web 用户" `
-            "优先 inetpub、站点物理路径、web.config、连接串。" `
+        Add-Finding MED "Identity looks like IIS app pool / web user" `
+            "Check inetpub, site roots, web.config, connection strings." `
             "whoami`ndir C:\inetpub`ndir C:\inetpub\wwwroot" `
             "prof_iis"
     }
     if ($env:USERNAME -match '(?i)mssql|sqlserver|sqlsvc') {
-        Add-Finding MED "用户名疑似 SQL 服务账号" `
-            "优先 SQL 安装目录、错误日志、连接串。" `
+        Add-Finding MED "Username looks like SQL service account" `
+            "Check SQL install dirs, error logs, connection strings." `
             "sc query state= all | findstr /i SQL" `
             "prof_sql"
     }
 
     if ($Mode -eq "full") {
         $os = systeminfo 2>$null | Select-String -Pattern 'OS Name|OS Version|System Type|Hotfix|Domain' | Out-String
-        Add-Finding INFO "系统信息摘要 (CVE 仅后备)" `
-            "发行版补丁情况复杂，内核 CVE 不作为主线。无常规路径时再人工核对。" `
+        Add-Finding INFO "OS info snapshot (CVE is last resort)" `
+            "Kernel CVE is NOT primary. Only check after standard privesc paths fail." `
             "systeminfo`nwmic qfe get HotFixID,InstalledOn" `
             "sysinfo_cve_note"
         [void]$script:Details.Add("systeminfo snippet:`n$os")
@@ -1006,7 +1036,7 @@ function Test-EnvHints {
 }
 
 function Print-Basic {
-    Section "基础环境 / Basic"
+    Section "Basic Environment"
     Write-Host "Time: $(Get-Date)"
     Write-Host "Host: $env:COMPUTERNAME"
     Write-Host "User: $env:USERDOMAIN\$env:USERNAME"
@@ -1016,12 +1046,12 @@ function Print-Basic {
     Write-Host "--- whoami /priv (Enabled only) ---"
     whoami /priv 2>$null | Select-String "Enabled|Privilege Name"
     Write-Host ""
-    Write-Host "--- admin-related groups ---"
-    whoami /groups 2>$null | Select-String "Administrators|S-1-5-32-544|Mandatory|Label|Backup|Operator"
+    Write-Host "--- interesting groups / integrity ---"
+    whoami /groups 2>$null | Select-String "Administrators|S-1-5-32-544|Mandatory|Label|Backup|Operator|Remote"
 }
 
 function Print-FullDetails {
-    Section "详细枚举 -Full / Details"
+    Section "Full Details"
     foreach ($d in $script:Details) {
         Write-Host $d
         Write-Host ""
@@ -1033,11 +1063,11 @@ function Print-FullDetails {
     netstat -ano 2>$null | Select-String "LISTENING"
     Section "cmdkey"
     cmdkey /list 2>$null
-    Section "LIMITS / 合规"
-    Write-Host "* 只枚举/提示，不自动利用"
-    Write-Host "* 服务 DACL 解析为启发式 SDDL 匹配，需手工 sc sdshow 确认"
-    Write-Host "* 写权限基于 ACL 只读判断 (不创建临时文件)"
-    Write-Host "* 内核 CVE 不作为主线"
+    Section "LIMITS"
+    Write-Host "* Enumerate + suggest only; no auto exploit"
+    Write-Host "* Service DACL parse is heuristic; confirm with sc sdshow"
+    Write-Host "* Write checks use ACL read-only (no temp file)"
+    Write-Host "* Kernel CVE is not primary line"
 }
 
 # ---------- main ----------
@@ -1053,11 +1083,11 @@ Print-Summary
 Print-Basic
 if ($Mode -eq "full") { Print-FullDetails }
 
-Section "结果汇总 / Result"
+Section "Result"
 Write-Host "HIGH: $High  MED: $Med  INFO: $Info"
-Write-Host "流程: 先验证 HIGH → MED；无结果再 WinPEAS/Seatbelt/SharpUp；CVE 最后。"
+Write-Host "Flow: verify HIGH then MED; then WinPEAS/Seatbelt; CVE last."
 Write-Host "Flow: verify HIGH then MED; then WinPEAS as 2nd opinion; CVE last."
-Write-Host "无 PowerShell 时用: opassist-win-cn.bat 或 windows-cmd-checklist.txt"
+Write-Host "No PowerShell? Use opassist-win-cn.bat or windows-cmd-checklist.txt"
 if ($Mode -ne "full") { Write-Host "Tip: re-run with -Full for raw dumps." }
 
 if ($transcriptOn) {
