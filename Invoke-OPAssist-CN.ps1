@@ -21,8 +21,9 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.0-en-ps"
+$Version = "1.9.1-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
+$script:DomainCtx = $null
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
 if ($Report) { $NoColor = $true }
@@ -144,11 +145,21 @@ function Print-Summary {
     Section "Priority Findings"
     Write-Host "Privesc-only summary (OSCP first pass). Use -Full for raw dumps."
     Write-Host "English-only UI for WinRM/EN consoles. Manual verification only."
+    if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
+        Write-Host ("[DOMAIN] {0} | user={1} | DC={2}" -f $script:DomainCtx.Dns, $script:DomainCtx.User, $script:DomainCtx.IsDC)
+        if ($script:High -eq 0) {
+            Write-Host "[DOMAIN] No local HIGH -> read findings tagged DOMAIN / SYSVOL first, then AD enum."
+        }
+    }
     Write-Host ""
 
     if ($script:Findings.Count -eq 0) {
         Write-Host "No clear local privesc leads in summary filters."
-        Write-Host "Next: whoami /priv, review services/tasks ACLs, WinPEAS/Seatbelt, or domain enum (BloodHound)."
+        if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
+            Write-Host "You are domain-joined: go to SYSVOL/NETLOGON + domain user/group enum (see DOMAIN findings if any)."
+        } else {
+            Write-Host "Next: whoami /priv, services/tasks ACLs, or WinPEAS/Seatbelt."
+        }
         return
     }
 
@@ -329,8 +340,145 @@ function Test-IsSystemPath([string]$Path) {
     return ($Path -match '(?i)\\Windows\\System32\\|\\Windows\\SysWOW64\\|\\Windows\\WinSxS\\|\\Windows\\servicing\\')
 }
 
+# ---------- domain context ----------
+function Get-DomainContext {
+    $ctx = [ordered]@{
+        IsDomain = $false
+        IsDC     = $false
+        NetBios  = $env:USERDOMAIN
+        Dns      = $env:USERDNSDOMAIN
+        Computer = $env:COMPUTERNAME
+        User     = "$env:USERDOMAIN\$env:USERNAME"
+    }
+    if ($env:USERDNSDOMAIN) {
+        $ctx.IsDomain = $true
+        $ctx.Dns = $env:USERDNSDOMAIN
+    }
+    if ($env:USERDOMAIN -and $env:COMPUTERNAME -and ($env:USERDOMAIN -ne $env:COMPUTERNAME)) {
+        $ctx.IsDomain = $true
+    }
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        if ($cs.PartOfDomain) {
+            $ctx.IsDomain = $true
+            if ($cs.Domain) { $ctx.Dns = $cs.Domain }
+        }
+        # DomainRole: 0=standalone ws, 1=member ws, 2=standalone server, 3=member server, 4=BDC, 5=PDC
+        if ($null -ne $cs.DomainRole -and [int]$cs.DomainRole -ge 4) {
+            $ctx.IsDC = $true
+            $ctx.IsDomain = $true
+        }
+    } catch {
+        try {
+            $cs = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop
+            if ($cs.PartOfDomain) { $ctx.IsDomain = $true; if ($cs.Domain) { $ctx.Dns = $cs.Domain } }
+            if ($null -ne $cs.DomainRole -and [int]$cs.DomainRole -ge 4) { $ctx.IsDC = $true; $ctx.IsDomain = $true }
+        } catch {}
+    }
+    if (-not $ctx.Dns -and $ctx.IsDomain -and $ctx.NetBios) { $ctx.Dns = $ctx.NetBios }
+    if ($env:LOGONSERVER) { $ctx.LogonServer = $env:LOGONSERVER.TrimStart('\') }
+    return $ctx
+}
+
+function Complete-DomainGuidance {
+    # Call AFTER all local checks so we know HIGH count.
+    $ctx = $script:DomainCtx
+    if (-not $ctx -or -not $ctx.IsDomain) { return }
+
+    $dns = if ($ctx.Dns) { $ctx.Dns } else { $ctx.NetBios }
+    $sysvol = "\\$dns\SYSVOL"
+    $netlogon = "\\$dns\NETLOGON"
+
+    if ($ctx.IsDC) {
+        Add-Finding MED "Host appears to be a Domain Controller ($($ctx.Computer))" `
+            "You are on a DC as $($ctx.User). Local misconfig privesc is often sparse for domain users. Prefer AD/domain paths (creds in SYSVOL, ACLs, kerberos, delegation) over hunting random local services." `
+            "whoami /all`nnltest /dsgetdc:$dns`n# You are already on DC - protect OPSEC; enum domain objects carefully" `
+            "domain_is_dc"
+    } else {
+        Add-Finding MED "Domain-joined host: $dns (user $($ctx.User))" `
+            "Machine is domain-joined. After local HIGH/MED, pivot to domain enum if local path is empty." `
+            "echo %USERDOMAIN% %USERDNSDOMAIN%`nnltest /dsgetdc:$dns`nnet time /domain" `
+            "domain_joined"
+    }
+
+    # SYSVOL / NETLOGON reachability (always try when domain)
+    $sysvolOk = $false
+    $netlogonOk = $false
+    try { if (Test-Path -LiteralPath $sysvol) { $sysvolOk = $true } } catch {}
+    try { if (Test-Path -LiteralPath $netlogon) { $netlogonOk = $true } } catch {}
+
+    if ($sysvolOk) {
+        Add-Finding MED "SYSVOL reachable: $sysvol  <-- prioritize domain file loot" `
+            "Best first domain step on many OSCP boxes: hunt GPO/scripts for passwords (Groups.xml cpassword, scripts, old configs). Do not full-recurse blindly if slow." `
+            "dir `"$sysvol`"`ndir `"$sysvol\$dns`"`ndir `"$sysvol\$dns\Policies`"`ndir `"$sysvol\$dns\scripts`"`ndir `"$netlogon`"`n# GPP (if present):`nfindstr /s /i /m cpassword `"$sysvol\*.xml`" 2>nul`nfindstr /s /i /m password `"$sysvol\*.xml`" `"$sysvol\*.ini`" `"$sysvol\*.bat`" `"$sysvol\*.ps1`" `"$sysvol\*.vbs`" 2>nul | more" `
+            "domain_sysvol"
+        # light GPP probe (already may have run in Test-PathAndAutorun; keep key if found)
+        try {
+            $gppHits = Get-ChildItem -Path $sysvol -Recurse -Include "Groups.xml","Services.xml","Scheduledtasks.xml","DataSources.xml","Drives.xml" -ErrorAction SilentlyContinue | Select-Object -First 20
+            foreach ($f in $gppHits) {
+                $raw = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
+                if ($raw -match 'cpassword=') {
+                    Add-Finding HIGH "GPP cpassword in SYSVOL: $($f.FullName)" `
+                        "Legacy Group Policy Preferences password. Decrypt offline (e.g. gpp-decrypt); script does not decrypt." `
+                        "type `"$($f.FullName)`"" `
+                        "gpp_sysvol:$($f.FullName)"
+                }
+            }
+        } catch {}
+    } elseif ($ctx.IsDomain) {
+        Add-Finding INFO "SYSVOL not reachable from here: $sysvol" `
+            "Try from another host or check DNS/name: \\$($ctx.NetBios)\SYSVOL" `
+            "dir `"$sysvol`"`ndir `"\\$($ctx.NetBios)\SYSVOL`"" `
+            "domain_sysvol_miss"
+    }
+
+    if ($netlogonOk -and -not $sysvolOk) {
+        Add-Finding MED "NETLOGON reachable: $netlogon" `
+            "Logon scripts sometimes contain credentials or share paths." `
+            "dir `"$netlogon`"`ntype `"$netlogon\*.bat`" 2>nul`ntype `"$netlogon\*.cmd`" 2>nul`ntype `"$netlogon\*.vbs`" 2>nul" `
+            "domain_netlogon"
+    }
+
+    # No local HIGH => explicit "switch to domain" playbook (this is what confused users)
+    if ($script:High -eq 0) {
+        $nl = [Environment]::NewLine
+        $play = @(
+            "# === DOMAIN PLAYBOOK (no local HIGH found) ===",
+            "# 1) Loot SYSVOL / NETLOGON for passwords and scripts",
+            "dir `"$sysvol`"",
+            "dir `"$netlogon`"",
+            "findstr /s /i /m cpassword `"$sysvol\*.xml`" 2>nul",
+            "findstr /s /i password `"$sysvol\*.xml`" `"$sysvol\*.bat`" `"$sysvol\*.ps1`" `"$netlogon\*.*`" 2>nul | more",
+            "# 2) Who am I in the domain?",
+            "whoami /all",
+            "net user $env:USERNAME /domain",
+            "net group /domain",
+            "net group `"Domain Admins`" /domain",
+            "nltest /dclist:$dns",
+            "nltest /dsgetdc:$dns",
+            "# 3) From attack host (only tools allowed in exam): BloodHound path to DA, kerberoast if in scope",
+            "# 4) If SeMachineAccountPrivilege enabled: review MachineAccountQuota / machine-account paths (manual)",
+            "# 5) After better domain creds, re-run local enum on new host/user"
+        ) -join $nl
+        Add-Finding MED "NO local HIGH leads -> switch to DOMAIN enum now" `
+            "Local privesc has no high-confidence items. On domain boxes (esp. DCs) this is normal for a low-priv domain user. Stop grinding weak local noise; follow domain playbook (SYSVOL, users/groups, kerberos, ACLs)." `
+            $play `
+            "domain_playbook_no_local_high"
+    } else {
+        Add-Finding INFO "Domain context active; still verify local HIGH first" `
+            "You have local HIGH findings AND domain membership. Finish local HIGH, then domain loot/lateral." `
+            "whoami /all`ndir `"$sysvol`"" `
+            "domain_after_local_high"
+    }
+}
+
 # ---------- checks ----------
 function Invoke-AllChecks {
+    $script:DomainCtx = Get-DomainContext
+    if ($script:DomainCtx.IsDomain) {
+        Write-Host "[*] Domain detected: DNS=$($script:DomainCtx.Dns) NetBIOS=$($script:DomainCtx.NetBios) DC=$($script:DomainCtx.IsDC)"
+    }
+
     Write-Host "[*] identity / groups / tokens ..."
     Test-IdentityAndTokens
     Write-Host "[*] AlwaysInstallElevated / Autologon / Unattend / SAM ..."
@@ -346,6 +494,8 @@ function Invoke-AllChecks {
     Test-LocalPorts
     Write-Host "[*] environment hints ..."
     Test-EnvHints
+    Write-Host "[*] domain guidance ..."
+    Complete-DomainGuidance
 }
 
 function Test-IdentityAndTokens {
@@ -835,28 +985,7 @@ function Test-PathAndAutorun {
             }
         }
     }
-    if ($env:USERDNSDOMAIN) {
-        $sysvol = "\\$($env:USERDNSDOMAIN)\SYSVOL"
-        if (Test-Path $sysvol) {
-            Add-Finding MED "SYSVOL readable: $sysvol" `
-                "Domain scripts/GPO may hold creds or writable scripts. Enumerate carefully (can be noisy/slow)." `
-                "dir `"$sysvol`"`n# look for scripts, Registry.xml, Groups.xml (GPP)" `
-                "sysvol"
-            # GPP cpassword classic (often patched but still check)
-            try {
-                $gpp = Get-ChildItem -Path $sysvol -Recurse -Include "Groups.xml","Services.xml","Scheduledtasks.xml","DataSources.xml","Drives.xml" -ErrorAction SilentlyContinue | Select-Object -First 15
-                foreach ($f in $gpp) {
-                    $raw = Get-Content -LiteralPath $f.FullName -Raw -ErrorAction SilentlyContinue
-                    if ($raw -match 'cpassword=') {
-                        Add-Finding HIGH "GPP may contain cpassword: $($f.FullName)" `
-                            "Legacy GPP credentials. Decrypt manually; script does not decrypt/use them." `
-                            "type `"$($f.FullName)`"`n# find cpassword= ..." `
-                            "gpp:$($f.FullName)"
-                    }
-                }
-            } catch {}
-        }
-    }
+    # SYSVOL deep guidance is centralized in Complete-DomainGuidance (avoids duplicate noise).
 }
 
 function Test-Credentials {
@@ -1004,12 +1133,7 @@ function Test-EnvHints {
         }
     } catch {}
 
-    if ($env:USERDOMAIN -and $env:COMPUTERNAME -and ($env:USERDOMAIN -ne $env:COMPUTERNAME)) {
-        Add-Finding INFO "Domain context: $env:USERDOMAIN" `
-            "Domain user on workstation/DC. After local enum, pivot to AD enum (BloodHound, kerberoast, etc.). This script stays local-focused." `
-            "whoami /fqdn`nnet user /domain`nnet group `"Domain Admins`" /domain`nnltest /dclist:" `
-            "domain"
-    }
+    # Domain playbook is emitted in Complete-DomainGuidance (after HIGH count is known).
 
     # service account profile lite
     if ("$env:USERDOMAIN\$env:USERNAME" -match 'IIS APPPOOL|IUSR') {
@@ -1085,8 +1209,17 @@ if ($Mode -eq "full") { Print-FullDetails }
 
 Section "Result"
 Write-Host "HIGH: $High  MED: $Med  INFO: $Info"
-Write-Host "Flow: verify HIGH then MED; then WinPEAS/Seatbelt; CVE last."
-Write-Host "Flow: verify HIGH then MED; then WinPEAS as 2nd opinion; CVE last."
+if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
+    Write-Host "Context: DOMAIN=$($script:DomainCtx.Dns)  DC=$($script:DomainCtx.IsDC)  User=$($script:DomainCtx.User)"
+    if ($High -eq 0) {
+        Write-Host "Recommended flow: DOMAIN loot (SYSVOL) -> domain enum -> better creds -> local privesc again."
+        Write-Host "Do NOT waste time on weak local noise (RDP group, empty RegBack, WindowsApps PATH)."
+    } else {
+        Write-Host "Recommended flow: local HIGH first -> then DOMAIN (SYSVOL/lateral)."
+    }
+} else {
+    Write-Host "Flow: verify HIGH then MED; then WinPEAS/Seatbelt; CVE last."
+}
 Write-Host "No PowerShell? Use opassist-win-cn.bat or windows-cmd-checklist.txt"
 if ($Mode -ne "full") { Write-Host "Tip: re-run with -Full for raw dumps." }
 
