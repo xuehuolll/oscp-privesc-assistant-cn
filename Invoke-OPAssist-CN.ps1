@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.3-en-ps"
+$Version = "1.9.4-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 # Priority: higher prints first within same severity (domain playbook > local noise)
@@ -567,6 +567,8 @@ function Invoke-AllChecks {
     Test-PathAndAutorun
     Write-Host "[*] credentials & local services ..."
     Test-Credentials
+    Write-Host "[*] web/DB config file locations ..."
+    Test-AppConfigInventory
     Test-LocalPorts
     Write-Host "[*] environment hints ..."
     Test-EnvHints
@@ -1136,28 +1138,7 @@ function Test-Credentials {
             "putty"
     }
 
-    # IIS / web configs
-    $roots = @("C:\inetpub", "C:\xampp", "C:\wamp64", "C:\wamp", "C:\ProgramData")
-    foreach ($root in $roots) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        $configs = @()
-        try {
-            $configs = Get-ChildItem -Path $root -Include "web.config","*.config","appsettings.json",".env","config.inc.php" -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -notmatch '\\WinSxS\\|\\Windows\\Microsoft|\\node_modules\\|\\Packages\\' } |
-                Select-Object -First $(if ($Mode -eq "full") { 80 } else { 30 })
-        } catch {}
-        foreach ($c in $configs) {
-            if ($script:CredHits -ge $script:CredHitCap) { break }
-            if (Test-StrongCredContent $c.FullName) {
-                $script:CredHits++
-                $sev = if ($c.Name -match 'web\.config|\.env|appsettings') { "HIGH" } else { "MED" }
-                Add-Finding $sev "Config looks like real credential assignment: $($c.FullName)" `
-                    "Hit password=/connectionString/token-like values. Do not paste secrets into reports." `
-                    "dir `"$($c.FullName)`"`nfindstr /ni /i `"password passwd pwd connectionString secret token`" `"$($c.FullName)`"" `
-                    "cred:$($c.FullName)"
-            }
-        }
-    }
+    # Strong-content cred hits are handled in Test-AppConfigInventory (locations + optional cred flag).
 
     # unattend already; also look for vnc/registry passwords
     $vnc = @(
@@ -1170,8 +1151,207 @@ function Test-Credentials {
             Add-Finding MED "VNC-related registry: $v" `
                 "May contain Password fields." `
                 "reg query $($v -replace ':','') /s" `
-                "vnc:$v"
+                "vnc:$v" `
+                -Priority 45
         }
+    }
+}
+
+function Get-IisSiteRoots {
+    $roots = New-Object System.Collections.Generic.List[string]
+    $appHost = "C:\Windows\System32\inetsrv\config\applicationHost.config"
+    if (-not (Test-Path -LiteralPath $appHost)) { return @() }
+    try {
+        [xml]$xml = Get-Content -LiteralPath $appHost -Raw -ErrorAction Stop
+        $sites = $xml.SelectNodes("//site")
+        foreach ($site in $sites) {
+            foreach ($app in $site.application) {
+                foreach ($vdir in $app.virtualDirectory) {
+                    $p = [string]$vdir.GetAttribute("physicalPath")
+                    if (-not $p) { continue }
+                    $p = [Environment]::ExpandEnvironmentVariables($p)
+                    if ($p -and (Test-Path -LiteralPath $p)) { [void]$roots.Add($p) }
+                }
+            }
+        }
+    } catch {
+        # Fallback: regex physicalPath= if XML parse fails
+        try {
+            $raw = Get-Content -LiteralPath $appHost -Raw -ErrorAction Stop
+            foreach ($m in [regex]::Matches($raw, 'physicalPath\s*=\s*"([^"]+)"', 'IgnoreCase')) {
+                $p = [Environment]::ExpandEnvironmentVariables($m.Groups[1].Value)
+                if ($p -and (Test-Path -LiteralPath $p)) { [void]$roots.Add($p) }
+            }
+        } catch {}
+    }
+    return @($roots | Select-Object -Unique)
+}
+
+function Test-ConfigLooksSensitive([string]$Path) {
+    # Lightweight peek: flag if connection/password keywords present. Does NOT print secrets.
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($item.Length -gt 1MB -or $item.Length -lt 10) { return $false }
+        $head = Get-Content -LiteralPath $Path -TotalCount 200 -ErrorAction Stop | Out-String
+        return [bool]($head -match '(?i)connectionString|password\s*=|pwd\s*=|Data Source|Initial Catalog|DB_PASSWORD|DATABASE_URL|requirepass|jdbc:|mysql://|postgres://|mongodb://|private[_-]?key|BEGIN [A-Z ]*PRIVATE KEY')
+    } catch { return $false }
+}
+
+function Test-AppConfigInventory {
+    # List interesting web/DB/app config LOCATIONS (paths). Keyword peek only; never print secret values.
+    # Fast path: fixed known files + one filtered recurse per root (not N patterns x full tree).
+
+    $nameRe = '(?i)^(web\.config|appsettings(\.[^\\/]+)?\.json|\.env(\..+)?|wp-config\.php|config\.inc\.php|config\.php|database\.php|settings\.php|local\.xml|application\.(properties|yml|yaml)|database\.yml|secrets\.yml|my\.ini|my\.cnf|\.my\.cnf|\.pgpass|pg_hba\.conf|redis\.conf|mongod\.conf|httpd\.conf|nginx\.conf|php\.ini|tomcat-users\.xml|server\.xml|context\.xml|app\.config|connectionstrings\.config)$'
+
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach ($r in @(
+        "C:\inetpub",
+        "C:\xampp", "C:\wamp64", "C:\wamp", "C:\laragon",
+        "C:\phpstudy_pro", "C:\phpStudy", "C:\www", "C:\wwwroot",
+        "C:\Users\Public",
+        "$env:USERPROFILE\Desktop",
+        "$env:USERPROFILE\Documents"
+    )) {
+        if ($r -and (Test-Path -LiteralPath $r)) { [void]$roots.Add($r) }
+    }
+    foreach ($iis in (Get-IisSiteRoots)) {
+        if ($iis -and -not ($roots -contains $iis)) { [void]$roots.Add($iis) }
+    }
+    foreach ($r in @("C:\Program Files\MySQL", "C:\Program Files\PostgreSQL", "C:\Program Files\MongoDB")) {
+        if (Test-Path -LiteralPath $r) { [void]$roots.Add($r) }
+    }
+
+    $fixed = @(
+        "C:\inetpub\wwwroot\web.config",
+        "C:\inetpub\wwwroot\.env",
+        "C:\xampp\phpMyAdmin\config.inc.php",
+        "C:\xampp\mysql\bin\my.ini",
+        "C:\xampp\apache\conf\httpd.conf",
+        "C:\xampp\apache\conf\extra\httpd-vhosts.conf",
+        "C:\Windows\System32\inetsrv\config\applicationHost.config",
+        "$env:USERPROFILE\.my.cnf",
+        "$env:USERPROFILE\.pgpass",
+        "$env:USERPROFILE\.aws\credentials"
+    )
+
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $maxList = if ($Mode -eq "full") { 40 } else { 18 }
+    $maxPerRoot = if ($Mode -eq "full") { 30 } else { 15 }
+
+    foreach ($f in $fixed) {
+        if (-not $f) { continue }
+        $key = $f.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $seen[$key] = $true
+        $sens = Test-ConfigLooksSensitive $f
+        [void]$found.Add([pscustomobject]@{ Path = $f; Sensitive = $sens })
+    }
+
+    # Also include known stack dirs discovered from running services (e.g. D:\phpstudy_pro)
+    try {
+        $svcs = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PathName
+        foreach ($sp in $svcs) {
+            if ($sp -match '(?i)(phpstudy|xampp|wamp|laragon|inetpub|tomcat|mysql|mariadb|postgres)') {
+                $exe = Get-ServiceExePath ([string]$sp)
+                if ($exe) {
+                    $dir = Split-Path -Parent $exe
+                    # walk up a few parents as possible install roots
+                    for ($i = 0; $i -lt 4 -and $dir; $i++) {
+                        if ($dir -match '(?i)phpstudy|xampp|wamp|laragon|tomcat|mysql|mariadb|postgres|inetpub' -and -not ($roots -contains $dir)) {
+                            [void]$roots.Add($dir)
+                        }
+                        $parent = Split-Path -Parent $dir
+                        if (-not $parent -or $parent -eq $dir) { break }
+                        $dir = $parent
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    foreach ($root in $roots) {
+        if ($found.Count -ge $maxList) { break }
+        try {
+            $depth = if ($Mode -eq "full") { 8 } else { 5 }
+            $enum = Get-ChildItem -Path $root -File -Recurse -Depth $depth -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -match $nameRe -and
+                    $_.FullName -notmatch '(?i)\\WinSxS\\|\\node_modules\\|\\Packages\\|\\Temporary ASP.NET'
+                } |
+                Select-Object -First $maxPerRoot
+            foreach ($it in $enum) {
+                if ($found.Count -ge $maxList) { break }
+                $path = $it.FullName
+                $key = $path.ToLowerInvariant()
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $sens = Test-ConfigLooksSensitive $path
+                [void]$found.Add([pscustomobject]@{ Path = $path; Sensitive = $sens })
+            }
+        } catch {}
+    }
+
+    if ($found.Count -eq 0) {
+        if ($Mode -eq "full") {
+            Add-Finding INFO "No common web/DB config paths found in scanned roots" `
+                "Checked inetpub/xampp/wamp/site roots/user folders. Manual: dir /s web.config .env" `
+                "dir /s /b C:\inetpub\web.config 2>nul" `
+                "cfg_none" -Priority 15
+        }
+        return
+    }
+
+    $ordered = @($found | Sort-Object -Property @{e = { -not $_.Sensitive } }, Path)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $sensCount = 0
+    foreach ($h in $ordered) {
+        if ($h.Sensitive) {
+            $sensCount++
+            [void]$lines.Add("[maybe-secret] $($h.Path)")
+        } else {
+            [void]$lines.Add($h.Path)
+        }
+    }
+
+    $nl = [Environment]::NewLine
+    $listText = ($lines | Select-Object -First $maxList) -join $nl
+    $inspect = New-Object System.Collections.Generic.List[string]
+    [void]$inspect.Add("# Inspect manually; do NOT paste secrets into exam report.")
+    foreach ($h in ($ordered | Select-Object -First 10)) {
+        if ($h.Sensitive) {
+            [void]$inspect.Add("findstr /ni /i `"password connectionString pwd= Data.Source DATABASE`" `"$($h.Path)`"")
+        } else {
+            [void]$inspect.Add("type `"$($h.Path)`" | more")
+        }
+    }
+    [void]$inspect.Add("dir /s /b C:\inetpub\web.config 2>nul")
+
+    Add-Finding MED "Web/DB/app config locations ($($found.Count) files)" `
+        "Found $($found.Count) interesting config path(s). $sensCount flagged [maybe-secret] via keyword peek only (values not printed)." `
+        ($listText + $nl + ($inspect -join $nl)) `
+        "cfg_inventory" `
+        -Priority 75
+
+    foreach ($h in $ordered) {
+        if ($script:CredHits -ge $script:CredHitCap) { break }
+        if (-not $h.Sensitive) { continue }
+        if (Test-StrongCredContent $h.Path) {
+            $script:CredHits++
+            $sev = if ($h.Path -match '(?i)web\.config|\.env$|appsettings|wp-config|config\.inc\.php') { "HIGH" } else { "MED" }
+            $prio = if ($sev -eq "HIGH") { 93 } else { 70 }
+            Add-Finding $sev "Config may contain credentials: $($h.Path)" `
+                "Strong keyword/value patterns detected. Review with findstr; do not paste plaintext secrets into reports." `
+                "dir `"$($h.Path)`"`nfindstr /ni /i `"password passwd pwd connectionString secret token Data.Source`" `"$($h.Path)`"" `
+                "cred:$($h.Path)" `
+                -Priority $prio
+        }
+    }
+
+    if ($Mode -eq "full") {
+        [void]$script:Details.Add("Config inventory:`n" + ($lines -join "`n"))
     }
 }
 
