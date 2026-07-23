@@ -1,135 +1,140 @@
-﻿# OSCP Privesc Assistant (CN) v1.8.9
+# OSCP Privesc Assistant (CN)
 
-鏈湴鎻愭潈**鏋氫妇 + 鎻愮ず**鍔╂墜锛圠inux / Windows锛夈€?
-- 鍙敹闆嗚瘉鎹€佹爣浼樺厛绾с€佺粰涓嬩竴姝?*鎵嬪伐**楠岃瘉鍛戒护  
-- **涓?*鑷姩鍒╃敤銆?*涓?*鏀规湇鍔?璁″垝浠诲姟/娉ㄥ唽琛ㄦ寔涔呭寲銆?*涓?*涓婁紶 payload銆?*涓?*鐖嗙牬  
-- 闈㈠悜 OSCP / PG / 鎺堟潈瀹為獙鐜  
+Local privilege-escalation **enumeration + hints** helper for **Linux / Windows**.
 
-> 浠呯敤浜庝綘鏈夋潈娴嬭瘯鐨勭郴缁熴€傛互鐢ㄥ悗鏋滆嚜璐熴€?
+本地提权枚举 + 提示助手（Linux / Windows）。
+
+- Collect evidence, rank priority, suggest **manual** next commands  
+  只收集证据、标优先级、给下一步手工验证命令
+- **No** auto exploit / service-task-registry persistence / payload upload / brute force  
+  **不**自动利用、**不**改服务/计划任务/注册表持久化、**不**上传 payload、**不**爆破
+- For OSCP / PG / authorized labs only  
+  仅用于 OSCP / PG / 授权实验环境
+
+> Use only on systems you are allowed to test.  
+> 仅用于你有权测试的系统，滥用后果自负。
+
 ---
 
-## 鏂囦欢缁撴瀯
+## Files / 文件
 
-```text
+`	ext
 .
-鈹溾攢鈹€ README.md
-鈹溾攢鈹€ LICENSE
-鈹溾攢鈹€ .gitignore
-鈹溾攢鈹€ opassist-linux-cn.sh          # Linux 涓昏剼鏈?鈹溾攢鈹€ Invoke-OPAssist-CN.ps1        # Windows 瀹屾暣鐗堬紙鏈?PowerShell 鏃舵帹鑽愶級
-鈹溾攢鈹€ opassist-win-cn.bat           # Windows 绾?CMD 鍏滃簳
-鈹斺攢鈹€ windows-cmd-checklist.txt     # 鏃犳硶钀藉湴鑴氭湰鏃剁殑绮樿创娓呭崟
-```
+├── README.md
+├── LICENSE
+├── .gitignore
+├── opassist-linux-cn.sh          # Linux
+├── Invoke-OPAssist-CN.ps1        # Windows PowerShell (recommended)
+├── opassist-win-cn.bat           # Windows CMD fallback
+└── windows-cmd-checklist.txt     # paste checklist
+`
 
-| 鍦烘櫙 | 鐢ㄤ粈涔?|
-|------|--------|
-| Linux shell | `opassist-linux-cn.sh` |
-| Windows + PowerShell | `Invoke-OPAssist-CN.ps1` |
-| Windows 鍙湁 cmd | `opassist-win-cn.bat` |
-| 涓嶈兘浼犳枃浠?| `windows-cmd-checklist.txt` 鍒嗘绮樿创 |
+| Scenario / 场景 | Use / 用什么 |
+|----------|-----|
+| Linux shell | opassist-linux-cn.sh |
+| Windows + PowerShell | Invoke-OPAssist-CN.ps1 |
+| Windows cmd only | opassist-win-cn.bat |
+| Cannot drop files / 不能传文件 | windows-cmd-checklist.txt |
 
 ---
 
-## 蹇€熷紑濮?
+## Quick start / 快速开始
+
 ### Linux
 
-```bash
+`ash
 chmod +x opassist-linux-cn.sh
-./opassist-linux-cn.sh              # 榛樿 summary
-./opassist-linux-cn.sh --full       # 璇︾粏鏋氫妇
+./opassist-linux-cn.sh
+./opassist-linux-cn.sh --full
 ./opassist-linux-cn.sh -o report.txt
-./opassist-linux-cn.sh --report -o report.txt
-```
+`
 
-### Windows (PowerShell锛屾帹鑽?
+### Windows (PowerShell)
 
-```powershell
+`powershell
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -Full
 powershell -ExecutionPolicy Bypass -File .\Invoke-OPAssist-CN.ps1 -OutFile C:\Users\Public\opassist.txt
-```
+`
 
-### Windows (绾?CMD)
+### Windows (CMD)
 
-```bat
+`at
 opassist-win-cn.bat
 opassist-win-cn.bat --full
 opassist-win-cn.bat -o C:\Users\Public\opassist.txt
-```
+`
 
 ---
 
-## 杈撳嚭鍘熷垯
+## Output / 输出
 
-榛樿 **privesc-only summary**锛氬彧鏄剧ず鑳芥帹杩涙彁鏉冪殑璇佹嵁銆?
-姣忔潯鍙戠幇澶ц嚧鍖呭惈锛?
-```text
+Default **privesc-only summary** (默认只显示能推进提权的证据).
+
+`	ext
 [n]
-!!! [楂樺嵄/HIGH] 鏍囬
-    鍘熷洜/Reason: ...
-    涓嬩竴姝?Next:
-      鎵嬪伐鍛戒护 ...
-```
+!!! [HIGH] title
+    Reason: ...
+    Next:
+      manual command ...
+`
 
-- **HIGH** 浼樺厛锛?*MED** 鏈変笂闄愶紝鍏朵綑鐢?`--full` / `-Full`  
-- 鍐呮牳 CVE **涓嶄綔涓轰富绾?*锛堝父瑙勮矾寰勬棤缁撴灉鍐嶈€冭檻锛? 
+- HIGH first; MED capped; use -Full / --full for more  
+- Kernel CVE is not primary  
 
----
+### Windows PS special behavior / Windows 特殊逻辑
 
-## 鍚堣杈圭晫
-
-| 鍏佽 | 绂佹 |
-|------|------|
-| 鏈湴鍙鏋氫妇 | 鑷姩鍒╃敤 / 鑷姩鎻愭潈 |
-| 椋庨櫓楂樹寒 + 寤鸿鍛戒护 | 淇敼鏈嶅姟 / 浠诲姟 / 娉ㄥ唽琛ㄦ寔涔呭寲 |
-| 鍙€変繚瀛樻姤鍛?| 涓婁紶/鎵ц payload |
-| ACL 鍙鍒ゆ柇鍐欐潈闄?(PS) | 鐖嗙牬鍑嵁 |
-
-PowerShell 鐗堢敤 ACL 鍒ゆ柇鍐欐潈闄愶紙灏介噺涓嶅啓涓存椂鏂囦欢锛夈€侰MD 鐗堝閮ㄥ垎鐩綍浣跨敤鐭椂涓存椂鏂囦欢鎺㈤拡锛堢敤鍚庡垹闄わ級銆?
----
-
-## 瑕嗙洊鑼冨洿锛堟憳瑕侊級
-
-### Linux (`opassist-linux-cn.sh`)
-
-鏁忔劅缁勩€乻udo銆丼UID/capabilities銆乧ron/systemd 鍙啓閾俱€佸嚟鎹?閰嶇疆寮虹壒寰併€佹湇鍔＄敾鍍忚瘎鍒嗐€丳ATH銆丯FS/瀹瑰櫒绾跨储绛夈€?
-### Windows (`Invoke-OPAssist-CN.ps1`)
-
-Token 鏉冮檺銆丄lwaysInstallElevated銆丄utologon銆乁nattend銆丼AM 澶囦唤銆佹湇鍔″彲鍐?鏈姞寮曞彿/寮?DACL銆佽鍒掍换鍔°€丳ATH/Run/Startup銆丟PO/SYSVOL/GPP銆佸嚟鎹簮銆佹湰鍦扮鍙ｃ€佹晱鎰熺粍绛夈€?
-### Windows CMD (`opassist-win-cn.bat`)
-
-涓婅堪涓诲共鐨?CMD 瀹炵幇锛涙湇鍔?DACL / 閮ㄥ垎 ACL 娣卞害寮变簬 PS 鐗堛€?
----
-
-## 寤鸿娴佺▼
-
-1. 鎷?shell 鈫?璺戝搴旇剼鏈紙榛樿 summary锛? 
-2. 鍏堥獙璇?**HIGH**锛屽啀 **MED**  
-3. 鏃犵粨鏋?鈫?linpeas / WinPEAS / Seatbelt 绛夌浜屾剰瑙? 
-4. 鏈€鍚庢墠鑰冭檻 CVE  
+| Situation | Behavior |
+|-----------|----------|
+| Already **SYSTEM** | Skip fake writable service/task spam; still scan creds/configs/domain loot |
+| Domain + no local HIGH | **DOMAIN MODE** playbook (SYSVOL / identity / AD next steps) |
+| Web/DB configs | List interesting config **paths** ([maybe-secret] flag only; no secret dump) |
 
 ---
 
-## 鐗堟湰
+## Compliance / 合规
 
-| 缁勪欢 | 鐗堟湰 |
-|------|------|
+| Allowed | Forbidden |
+|---------|-----------|
+| Local enumeration | Auto exploit |
+| Hints + suggested commands | Change services/tasks/registry persistence |
+| Optional report file | Upload/run payload |
+| ACL-based write checks (PS) | Credential brute force |
+
+---
+
+## Coverage / 覆盖 (摘要)
+
+**Linux:** groups, sudo, SUID/caps, cron/systemd write chains, cred/config scoring, service profiles, PATH, NFS/container.  
+
+**Windows PS:** tokens, AIE, Autologon, Unattend, SAM backups, service write/unquoted/DACL, tasks (Microsoft noise filtered), PATH/Run/Startup, GPO/SYSVOL/GPP, creds, web/DB config inventory, ports, domain playbook, SYSTEM short-circuit.  
+
+**Windows CMD:** main checks in pure cmd; less depth than PS.
+
+---
+
+## Workflow / 建议流程
+
+1. Get shell -> run matching script  
+2. Verify HIGH, then MED  
+3. If empty -> linpeas / WinPEAS as second opinion  
+4. Domain + no local HIGH -> SYSVOL + AD enum first  
+5. CVE last  
+
+---
+
+## Versions
+
+| Component | Version |
+|-----------|---------|
 | Linux | 1.8.8-cn |
-| Windows PowerShell | **1.9.6-en-ps** |
+| Windows PowerShell | 1.9.6-en-ps |
 | Windows CMD | 1.8.8-cn-cmd |
-
-### Windows PS recent hardening
-
-- English-only UI (WinRM-safe)
-- Less noise: RDP/WinRM groups, empty RegBack, WindowsApps PATH, SMB ports
-- Domain playbook when no local HIGH (single consolidated MED + commands)
-- Finding **priority sort** (domain playbook / GPP / service write first)
-- Faster service pass; list web/DB config file locations (paths only)
-- Stronger DC detection (ProductType, NTDS, local SYSVOL, hostname)
 
 ---
 
 ## License
 
-MIT 鈥?瑙?[LICENSE](./LICENSE)銆?
-浠呯敤浜庢巿鏉冩祴璇曚笌瀛︿範銆傛姤鍛婁腑璇疯劚鏁忥紝鍕跨矘璐存棤鎰忎箟鏄庢枃瀵嗙爜銆?
+MIT — see [LICENSE](./LICENSE).
 
+Authorized testing / learning only. Redact secrets in reports.
