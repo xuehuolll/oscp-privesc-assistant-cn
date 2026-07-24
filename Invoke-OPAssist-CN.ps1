@@ -21,12 +21,13 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.10-en-ps"
+$Version = "1.9.11-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $script:AlreadySystem = $false
 $script:SkipWriteChecks = $false  # true when SYSTEM / high-integrity admin (write checks are meaningless noise)
 $script:IsEvilWinRM = $false      # WinRM remoting host (Evil-WinRM-style); gates download/upload Next text only
+$script:EvilWinRMWhy = ""         # which signal fired (for banner / debug)
 # Priority: higher prints first within same severity (domain playbook > local noise)
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
@@ -242,21 +243,34 @@ function Get-Win32ProcessById([int]$ProcessId) {
 function Test-IsEvilWinRMSession {
     <#
     .SYNOPSIS
-      Detect WinRM remoting host used by Evil-WinRM (and Enter-PSSession).
+      Detect WinRM remoting / Evil-WinRM-style session on the target.
     .NOTES
-      Server cannot see the client binary name.
-      Signals: Host.Name, PSSenderInfo, OR ancestor process wsmprovhost.exe.
-      Nested "powershell -File script.ps1" under Evil-WinRM is ConsoleHost with
-      parent powershell.exe; must walk the parent chain (not only immediate parent).
+      Client binary name is NOT visible server-side.
+      Nested "powershell -File script.ps1" under Evil-WinRM:
+        - Host.Name becomes ConsoleHost (not ServerRemoteHost)
+        - PSSenderInfo is gone
+        - WMI parent chain to wsmprovhost often fails (ACL / incomplete CIM)
+      Reliable OSCP fingerprint from token groups (seen on real Evil-WinRM):
+        Remote Management Users (S-1-5-32-580) + NETWORK (S-1-5-2)
+        and NOT INTERACTIVE (S-1-5-4) / Remote Interactive (S-1-5-14).
+      Sets $script:EvilWinRMWhy when true.
     #>
+    $script:EvilWinRMWhy = ""
+
     try {
-        if ($Host -and $Host.Name -eq 'ServerRemoteHost') { return $true }
+        if ($Host -and $Host.Name -eq 'ServerRemoteHost') {
+            $script:EvilWinRMWhy = "Host.Name=ServerRemoteHost"
+            return $true
+        }
     } catch {}
     try {
-        if ($PSSenderInfo) { return $true }
+        if ($PSSenderInfo) {
+            $script:EvilWinRMWhy = "PSSenderInfo"
+            return $true
+        }
     } catch {}
 
-    # Walk parents: powershell -File -> powershell (WinRM) -> wsmprovhost.exe
+    # Walk parents: powershell -File -> ... -> wsmprovhost.exe (best-effort; often blocked)
     $walkId = $PID
     $seen = @{}
     for ($i = 0; $i -lt 12; $i++) {
@@ -265,15 +279,64 @@ function Test-IsEvilWinRMSession {
         $proc = Get-Win32ProcessById $walkId
         if (-not $proc) { break }
         $name = [string]$proc.Name
-        if ($name -match '(?i)^wsmprovhost(\.exe)?$') { return $true }
-        # Some hosts show the executable path instead of short name
+        if ($name -match '(?i)^wsmprovhost(\.exe)?$') {
+            $script:EvilWinRMWhy = "ancestor=wsmprovhost"
+            return $true
+        }
         $cmd = [string]$proc.CommandLine
-        if ($cmd -match '(?i)\\wsmprovhost(\.exe)?(\s|$)') { return $true }
+        if ($cmd -match '(?i)\\wsmprovhost(\.exe)?(\s|$)') {
+            $script:EvilWinRMWhy = "ancestor-cmd=wsmprovhost"
+            return $true
+        }
         $ppid = 0
         try { $ppid = [int]$proc.ParentProcessId } catch { $ppid = 0 }
         if ($ppid -le 0 -or $ppid -eq $walkId) { break }
         $walkId = $ppid
     }
+
+    # Token fingerprint: works for nested powershell -File under Evil-WinRM
+    # Matches lab paste: Remote Management Users + NETWORK, no INTERACTIVE line.
+    try {
+        $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $sids = @()
+        if ($id.Groups) {
+            foreach ($g in $id.Groups) {
+                try { $sids += $g.Value } catch {}
+            }
+        }
+        $remoteMgmt = ($sids -contains 'S-1-5-32-580')
+        $network    = ($sids -contains 'S-1-5-2')
+        $interactive = ($sids -contains 'S-1-5-4')
+        $remoteInteractive = ($sids -contains 'S-1-5-14')
+        if ($remoteMgmt -and $network -and (-not $interactive) -and (-not $remoteInteractive)) {
+            $script:EvilWinRMWhy = "token=RemoteManagement+NETWORK(no INTERACTIVE)"
+            return $true
+        }
+        # Fallback: Remote Management + no interactive desktop session name
+        # (some hosts omit NETWORK in odd tokens; SESSIONNAME empty is common for WinRM)
+        $sess = [string]$env:SESSIONNAME
+        $sessEmpty = [string]::IsNullOrWhiteSpace($sess) -or ($sess -match '(?i)^(Services)$')
+        if ($remoteMgmt -and $sessEmpty -and (-not $interactive) -and (-not $remoteInteractive)) {
+            $script:EvilWinRMWhy = "token=RemoteManagement+emptySESSIONNAME"
+            return $true
+        }
+    } catch {}
+
+    # whoami /groups text fallback (WindowsIdentity.Groups can be incomplete under nested PS)
+    try {
+        $grpText = (whoami /groups 2>$null | Out-String)
+        if ($grpText) {
+            $hasRm = $grpText -match 'S-1-5-32-580|Remote Management Users'
+            $hasNet = $grpText -match 'S-1-5-2\b|NT AUTHORITY\\NETWORK'
+            $hasInt = $grpText -match 'S-1-5-4\b|NT AUTHORITY\\INTERACTIVE'
+            $hasRint = $grpText -match 'S-1-5-14\b|Remote Interactive'
+            if ($hasRm -and $hasNet -and (-not $hasInt) -and (-not $hasRint)) {
+                $script:EvilWinRMWhy = "whoami=RemoteManagement+NETWORK(no INTERACTIVE)"
+                return $true
+            }
+        }
+    } catch {}
+
     return $false
 }
 
@@ -689,7 +752,8 @@ function Invoke-AllChecks {
 
     $script:IsEvilWinRM = Test-IsEvilWinRMSession
     if ($script:IsEvilWinRM) {
-        Write-Host "[*] WinRM remoting host detected (Evil-WinRM-style). Loot Next will use download/upload hints."
+        $why = if ($script:EvilWinRMWhy) { $script:EvilWinRMWhy } else { "unknown" }
+        Write-Host "[*] WinRM/Evil-WinRM-style session detected ($why). Loot Next uses download/upload hints."
     }
 
     Write-Host "[*] identity / groups / tokens ..."
