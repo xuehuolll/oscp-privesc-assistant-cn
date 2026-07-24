@@ -2,7 +2,7 @@
 # OSCP Privesc Assistant - Linux Chinese Concise Edition
 # 只枚举/提示/生成建议命令；不自动利用、不修改系统、不上传 payload。
 
-VERSION="1.8.8-cn"
+VERSION="1.8.9-cn"
 MODE="summary"
 NO_COLOR=0
 REPORT_MODE=0
@@ -30,6 +30,7 @@ usage() {
 
 设计边界：
   只做本地枚举、高亮和手工验证建议；不会自动利用漏洞、修改文件、写 cron、替换服务、下载 payload 或自动提权。
+  v1.8.9 排除 /dev/null 等设备节点假“可写 cron 目标”；不可读配置不再刷 Permission denied。
   v1.8.8 privesc-only summary：summary 只显示能直接推进提权的证据；普通服务发现/反代/Web root 放到 --full。
 USAGE
 }
@@ -57,6 +58,48 @@ fi
 section(){ echo; echo "========== $1 =========="; }
 cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 is_writable(){ [ -e "$1" ] && [ -w "$1" ] 2>/dev/null; }
+
+# Device nodes / VFS: often world-writable by design (e.g. /dev/null from cron ">/dev/null").
+# Not a privesc "writable cron target".
+is_noise_path(){
+  local p="$1"
+  [ -n "$p" ] || return 0
+  case "$p" in
+    /dev/null|/dev/zero|/dev/full|/dev/random|/dev/urandom|/dev/tty|/dev/console|/dev/stdin|/dev/stdout|/dev/stderr)
+      return 0 ;;
+    /dev/fd/*|/dev/pts/*|/proc/*|/sys/*)
+      return 0 ;;
+    # /dev/* except /dev/shm (staging sometimes real); parent-only /dev also noise
+    /dev|/dev/*)
+      case "$p" in /dev/shm|/dev/shm/*) return 1 ;; esac
+      return 0 ;;
+    /proc|/sys) return 0 ;;
+  esac
+  # character/block device, named pipe, socket
+  if [ -c "$p" ] || [ -b "$p" ] || [ -p "$p" ] || [ -S "$p" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Writable in a way that could mean file replace / hijack for root execution chains.
+is_writable_exec_target(){
+  local p="$1"
+  is_noise_path "$p" && return 1
+  is_writable "$p" || return 1
+  return 0
+}
+
+is_writable_exec_parent(){
+  local d="$1"
+  [ -n "$d" ] || return 1
+  is_noise_path "$d" && return 1
+  case "$d" in
+    /|/bin|/sbin|/usr|/usr/bin|/usr/sbin|/lib|/lib64|/etc|/boot) return 1 ;;
+  esac
+  [ -d "$d" ] && is_writable "$d"
+}
+
 is_custom_path(){ case "$1" in /opt/*|/var/www/*|/home/*|/srv/*|/usr/local/*|/tmp/*|/var/tmp/*|/dev/shm/*) return 0;; *) return 1;; esac; }
 TO=""; command -v timeout >/dev/null 2>&1 && TO="timeout 8"
 TO2=""; command -v timeout >/dev/null 2>&1 && TO2="timeout 2"
@@ -215,15 +258,18 @@ check_cron(){
       paths="$(printf '%s\n' "$line" | extract_abs_paths)"
       while IFS= read -r path; do
         [ -z "$path" ] && continue
-        # 默认只关心自定义路径或当前用户可写路径；系统默认 cron 不进主清单。
-        if is_custom_path "$path" || is_writable "$path" || is_writable "$(dirname "$path")"; then
+        # Skip >/dev/null style redirections and other non-hijackable nodes (classic false HIGH).
+        is_noise_path "$path" && continue
+        local parent; parent="$(dirname "$path")"
+        # 默认只关心自定义路径或当前用户可写（真实文件/目录）路径；系统默认 cron 不进主清单。
+        if is_custom_path "$path" || is_writable_exec_target "$path" || is_writable_exec_parent "$parent"; then
           custom_lines+=("$f :: $line :: $path")
           local reason="root cron 调用 $path。"
-          local next="$(printf "ls -la '%s' 2>/dev/null\nls -ld '%s' 2>/dev/null\nsed -n '1,200p' '%s' 2>/dev/null\ngrep -nE 'exiftool|IMAGES|LOGFILE|PATH|tar|find|cp|mv|rsync|convert|magick' '%s' 2>/dev/null\nfind /var/www /opt /tmp /var/tmp -type d -writable 2>/dev/null | head" "$path" "$(dirname "$path")" "$path" "$path")"
-          if is_writable "$path"; then
+          local next="$(printf "ls -la '%s' 2>/dev/null\nls -ld '%s' 2>/dev/null\nsed -n '1,200p' '%s' 2>/dev/null\ngrep -nE 'exiftool|IMAGES|LOGFILE|PATH|tar|find|cp|mv|rsync|convert|magick' '%s' 2>/dev/null\nfind /var/www /opt /tmp /var/tmp -type d -writable 2>/dev/null | head" "$path" "$parent" "$path" "$path")"
+          if is_writable_exec_target "$path"; then
             add_finding HIGH "root cron 执行的目标当前用户可写：$path" "$reason 这是高确定性提权点。" "$next" "cron:wtarget:$path"
-          elif is_writable "$(dirname "$path")"; then
-            add_finding HIGH "root cron 目标父目录当前用户可写：$(dirname "$path")" "$reason 可尝试文件替换、依赖文件或通配符场景，但需手工验证。" "$next" "cron:wparent:$(dirname "$path")"
+          elif is_writable_exec_parent "$parent"; then
+            add_finding HIGH "root cron 目标父目录当前用户可写：$parent" "$reason 可尝试文件替换、依赖文件或通配符场景，但需手工验证。" "$next" "cron:wparent:$parent"
           else
             local extra=""
             if [ -r "$path" ] && [ -f "$path" ] && is_custom_path "$path"; then
@@ -262,7 +308,7 @@ check_systemd(){
     while IFS= read -r e; do
       [ -z "$e" ] && continue
       p="$e"; parent="$(dirname "$p")"
-      if is_writable "$p" || is_writable "$parent"; then
+      if is_writable_exec_target "$p" || is_writable_exec_parent "$parent"; then
         add_finding HIGH "systemd Exec 路径或父目录当前用户可写：$p" "unit=$base active=$state enabled=$enabled。systemd/root 可能执行该路径。" "$(printf "systemctl cat '%s'\nls -la '%s'\nls -ld '%s'" "$base" "$p" "$parent")" "systemd:exec:$p"
       elif is_custom_path "$p" && { [ "$state" = "active" ] || [ "$enabled" = "enabled" ]; }; then
         [ "$count" -lt 3 ] && add_finding MED "systemd 服务指向自定义路径：$p" "unit=$base active=$state enabled=$enabled。当前不可写，检查程序目录和配置文件。" "$(printf "systemctl cat '%s'\nls -la '%s'\nls -ld '%s'" "$base" "$p" "$parent")" "systemd:custom:$p"
@@ -432,11 +478,15 @@ score_app_files(){
     if file_content_hit "$f" "$STRONG_VALUE_RE"; then
       score=$((score+45)); reason="$reason content:value"
     fi
-    size="$(wc -c < "$f" 2>/dev/null || echo 0)"
+    size=0
+    if [ -r "$f" ]; then
+      size="$(wc -c <"$f" 2>/dev/null | tr -d '[:space:]')"
+      size="${size:-0}"
+    fi
     if [ "${size:-0}" -lt 80 ]; then
       score=$((score-45)); penalty="$penalty 内容过短/空文件降权"
     fi
-    if head -c 5000 "$f" 2>/dev/null | grep -aEiq '^[[:space:]]*<list[[:space:]]*/>[[:space:]]*$|<backup-dir[[:space:]]+path='; then
+    if [ -r "$f" ] && head -c 5000 "$f" 2>/dev/null | grep -aEiq '^[[:space:]]*<list[[:space:]]*/>[[:space:]]*$|<backup-dir[[:space:]]+path='; then
       score=$((score-45)); penalty="$penalty 空列表/弱备份配置降权"
     fi
 
