@@ -2,7 +2,7 @@
 # OSCP Privesc Assistant - Linux Chinese Concise Edition
 # 只枚举/提示/生成建议命令；不自动利用、不修改系统、不上传 payload。
 
-VERSION="1.9.0-cn"
+VERSION="1.9.1-cn"
 MODE="summary"
 NO_COLOR=0
 REPORT_MODE=0
@@ -30,6 +30,7 @@ usage() {
 
 设计边界：
   只做本地枚举、高亮和手工验证建议；不会自动利用漏洞、修改文件、写 cron、替换服务、下载 payload 或自动提权。
+  v1.9.1 降噪：关联目录合并为一条；软链按目标树聚合；过滤发行版自带 cron.d。
   v1.9.0 root 执行链类别目录：非默认 root cron、/root 脚本、用户属主 /opt|/srv、bin symlink 指向可写目标。
   v1.8.9 排除 /dev/null 等设备节点假“可写 cron 目标”；不可读配置不再刷 Permission denied。
   v1.8.8 privesc-only summary：summary 只显示能直接推进提权的证据；普通服务发现/反代/Web root 放到 --full。
@@ -124,14 +125,55 @@ is_interesting_exec_path(){
   return 1
 }
 
-# Stock Debian/Ubuntu /etc/crontab noise — not a privesc lead by itself.
+# Stock Debian/Ubuntu crontab + common package cron.d noise — not a privesc lead by itself.
 is_default_os_cron_line(){
   local line="$1"
   echo "$line" | grep -Eq 'run-parts[[:space:]].*/etc/cron\.(hourly|daily|weekly|monthly)' && return 0
   echo "$line" | grep -Eq '[[:space:]]anacron([[:space:]]|$)' && return 0
   echo "$line" | grep -Eq 'debian-sa1|/usr/lib/sysstat|logrotate' && return 0
   echo "$line" | grep -Eq '^[[:space:]]*[A-Z_]+=' && return 0  # SHELL= PATH= etc.
+  # Common distro package jobs
+  echo "$line" | grep -Eqi 'popularity-contest|sessionclean|e2scrub|mdadm|certbot|logwatch|apticron|chkrootkit|rkhunter| ban' && return 0
+  # Paths only under system package locations (no OSCP-interesting roots)
+  if ! echo "$line" | grep -Eq '/(opt|home|root|srv|var/www|var/opt|usr/local|tmp|var/tmp|dev/shm)/'; then
+    if echo "$line" | grep -Eq '/(usr/lib|lib/x86_64|lib/systemd|sbin/|/etc/cron\.(daily|hourly|weekly|monthly)/)'; then
+      return 0
+    fi
+  fi
   return 1
+}
+
+# Writable files that are plausible execution/hijack targets (not docs/jars spam).
+is_plausible_hijack_file(){
+  local p="$1"
+  [ -n "$p" ] || return 1
+  is_noise_path "$p" && return 1
+  case "$p" in
+    *.md|*.txt|*.html|*.htm|*.pdf|*.png|*.jpg|*.gif|*.css|*.po|*.mo|*.jar|*.war|*.zip|*.gz|*.tgz|*.deb|*.rpm)
+      return 1 ;;
+    */doc/*|*/docs/*|*/man/*|*/share/doc/*|*/examples/*|*/test/*|*/tests/*)
+      return 1 ;;
+  esac
+  # Prefer bin/sbin, scripts, or executable bit
+  case "$p" in
+    */bin/*|*/sbin/*|*.sh|*.bash|*.py|*.pl|*.rb|*.php) return 0 ;;
+  esac
+  [ -x "$p" ] && [ -f "$p" ] && return 0
+  [ -L "$p" ] && return 0
+  return 1
+}
+
+# Group path into service tree root e.g. /opt/aerospike/bin/x -> /opt/aerospike
+service_tree_root(){
+  local p="$1"
+  case "$p" in
+    /opt/*|/srv/*|/var/www/*|/var/opt/*|/usr/local/*|/home/*)
+      echo "$p" | awk -F/ '{print "/"$2"/"$3}'
+      ;;
+    *)
+      dirname "$p"
+      ;;
+  esac
 }
 
 # Basename tokens from path/line for correlating cron <-> /opt/<service>
@@ -358,7 +400,7 @@ extract_abs_paths(){
 #   /opt /srv /var/www /var/opt /usr/local /home /tmp /var/tmp /dev/shm
 check_cron_path_correlations(){
   local line="$1" src="$2"
-  local tok cand owner next roots
+  local tok cand owner next roots samples sample
   roots="/opt /srv /var/www /var/opt /usr/local /home /tmp /var/tmp /dev/shm"
   while IFS= read -r tok; do
     [ -z "$tok" ] && continue
@@ -369,25 +411,22 @@ check_cron_path_correlations(){
       [ -e "$cand" ] || continue
       owner="$(path_owner_name "$cand")"
       if is_user_controlled_path "$cand" || is_owned_by_me "$cand"; then
-        next="$(printf "ls -la '%s'\nls -la '%s/bin' 2>/dev/null\nfind '%s' -writable 2>/dev/null | head -n 40\n# root cron 行：\n%s\n# 来源：%s\n# 若 cron 会调用该树中的 bin/脚本/symlink，可替换后等待调度\n# 验证：pspy / 观察 mtime；ls -la /usr/bin | grep -i '%s'" \
-          "$cand" "$cand" "$cand" "$line" "$src" "$tok")"
+        # Sample plausible hijack files under tree (into Next only — one HIGH per tree)
+        samples=""
+        if [ -d "$cand" ]; then
+          while IFS= read -r sample; do
+            [ -z "$sample" ] && continue
+            is_writable_exec_target "$sample" || continue
+            is_plausible_hijack_file "$sample" || continue
+            samples="${samples}${sample}"$'\n'
+          done < <($TO find "$cand/bin" "$cand/sbin" "$cand" -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | head -n 80)
+          samples="$(printf '%s' "$samples" | sed '/^$/d' | head -n 8)"
+        fi
+        next="$(printf "ls -la '%s'\nls -la '%s/bin' 2>/dev/null\nfind '%s/bin' -writable 2>/dev/null | head -n 30\n# 优先可劫持样本（bin/脚本/可执行，已过滤 doc/jar）：\n%s\n# root cron 行：\n%s\n# 来源：%s\n# 验证：pspy；ls -la /usr/bin | grep -E '->.*%s'\n# 替换 bin 内被 root 调用的目标后等待 cron" \
+          "$cand" "$cand" "$cand" "${samples:-#(未抽样到 bin/可执行，仍 ls bin/)}" "$line" "$src" "$tok")"
         add_finding HIGH "root cron 关联用户可控目录：$cand" \
-          "非默认 root cron 与目录名/服务名 '$tok' 相关，且该路径属主或可写属于当前用户(owner=$owner)。OSCP 常见：root 跑 /root/<svc>.sh 或绝对路径，实际依赖 /opt/<svc>/bin 等你可控文件。" \
+          "非默认 root cron 与目录名/服务名 '$tok' 相关，且该路径属主或可写属于当前用户(owner=$owner)。OSCP 常见：root 跑 /root/<svc>.sh，实际依赖 /opt/<svc>/bin 等你可控文件。单文件可写不再逐条刷屏，见下方样本。" \
           "$next" "cron:corr:$cand"
-      fi
-      # Writable files under matching tree (cap to avoid spam)
-      if [ -d "$cand" ]; then
-        local wf wcount=0
-        while IFS= read -r wf; do
-          [ -z "$wf" ] && continue
-          is_writable_exec_target "$wf" || continue
-          wcount=$((wcount + 1))
-          [ "$wcount" -gt 6 ] && break
-          next="$(printf "ls -la '%s'\nfile '%s'\n# root cron 关联 token=%s\n%s" "$wf" "$wf" "$tok" "$line")"
-          add_finding HIGH "root cron 关联可写文件：$wf" \
-            "与 token '$tok' 相关的路径当前用户可写；若 root 执行链会触达该文件则为高确定性提权点。" \
-            "$next" "cron:corrfile:$wf"
-        done < <($TO find "$cand" -maxdepth 3 \( -type f -o -type l \) 2>/dev/null | head -n 60)
       fi
     done
   done < <(cron_name_tokens "$line" | sort -u)
@@ -484,17 +523,22 @@ check_cron(){
 
 # Category: service trees under OSCP-common roots owned by current user (root often still runs tools from there).
 check_user_owned_service_trees(){
-  local root d owner next bins n
+  local root d owner next n k already
   for root in /opt /srv /var/www /var/opt /usr/local; do
     [ -d "$root" ] || continue
     while IFS= read -r d; do
       [ -z "$d" ] && continue
       [ -d "$d" ] || continue
       is_owned_by_me "$d" || is_writable_exec_parent "$d" || continue
+      # Already covered by stronger cron correlation finding — avoid duplicate HIGH
+      already=0
+      for k in "${FINDING_KEYS[@]}"; do
+        [ "$k" = "cron:corr:$d" ] && already=1 && break
+      done
+      [ "$already" -eq 1 ] && continue
       owner="$(path_owner_name "$d")"
-      bins="$(ls -la "$d/bin" 2>/dev/null | head -n 20)"
       n="$(find "$d" -maxdepth 3 \( -type f -o -type l \) -perm -0111 2>/dev/null | head -n 15 | wc -l | tr -d ' ')"
-      next="$(printf "ls -la '%s'\nls -la '%s/bin' 2>/dev/null\nfind '%s' -maxdepth 3 -writable 2>/dev/null | head -n 40\nfind '%s' -maxdepth 3 \\( -type f -o -type l \\) -perm -0111 2>/dev/null | head -n 30\n# 交叉验证 root 是否调用：\ngrep -Rns '%s' /etc/crontab /etc/cron.d /etc/cron.* 2>/dev/null | head\nls -la /usr/bin /bin 2>/dev/null | grep -E '-> *%s|%s'\n# pspy 看 UID=0 是否执行该树中的文件" \
+      next="$(printf "ls -la '%s'\nls -la '%s/bin' 2>/dev/null\nfind '%s/bin' -writable 2>/dev/null | head -n 40\nfind '%s' -maxdepth 3 \\( -type f -o -type l \\) -perm -0111 2>/dev/null | head -n 30\n# 交叉验证 root 是否调用：\ngrep -Rns '%s' /etc/crontab /etc/cron.d 2>/dev/null | head\nls -la /usr/bin /bin 2>/dev/null | grep -E '-> *%s|%s'\n# pspy 看 UID=0 是否执行该树中的文件" \
         "$d" "$d" "$d" "$d" "$(basename "$d")" "$d" "$(basename "$d")")"
       if [ "${n:-0}" -gt 0 ] || [ -d "$d/bin" ]; then
         add_finding HIGH "当前用户拥有的服务/应用目录：$d" \
@@ -509,9 +553,12 @@ check_user_owned_service_trees(){
   done
 }
 
-# Category: /usr/bin|/bin|/usr/local/bin symlinks into user-controlled paths (asinfo -> /opt/.../asinfo).
+# Category: /usr/bin|/bin|/usr/local/bin symlinks into user-controlled paths — aggregate by service tree.
 check_hijackable_bin_symlinks(){
-  local link target next
+  local link target tree next list count t tmpmap
+  tmpmap="$(mktemp 2>/dev/null || echo "/tmp/.opa_sym.$$")"
+  : >"$tmpmap" 2>/dev/null || return 0
+
   while IFS= read -r link; do
     [ -z "$link" ] && continue
     [ -L "$link" ] || continue
@@ -523,13 +570,27 @@ check_hijackable_bin_symlinks(){
       *) continue ;;
     esac
     if is_user_controlled_path "$target" || is_writable_exec_target "$target" || is_owned_by_me "$target"; then
-      next="$(printf "ls -la '%s'\nreadlink -f '%s'\nls -la '%s'\n# 若 root/cron/systemd 会调用该命令名，替换目标文件即可\n# 验证：pspy | grep %s；grep -Rns '%s' /etc/cron* /etc/crontab 2>/dev/null" \
-        "$link" "$link" "$target" "$(basename "$link")" "$(basename "$link")")"
-      add_finding HIGH "系统命令软链指向用户可控路径：$link -> $target" \
-        "PATH 中的命令名解析到你可控文件。root 脚本用命令名（非只信绝对路径）或绝对路径点到该 link 时，可导致提权。" \
-        "$next" "symlink:hijack:$link"
+      tree="$(service_tree_root "$target")"
+      [ -n "$tree" ] || tree="$(dirname "$target")"
+      # tree|link -> target  (use | so paths with spaces are less painful)
+      printf '%s|%s -> %s\n' "$tree" "$link" "$target" >>"$tmpmap"
     fi
   done < <($TO find /usr/bin /bin /usr/local/bin -maxdepth 1 -type l 2>/dev/null | head -n 300)
+
+  # One HIGH per target tree
+  while IFS= read -r t; do
+    [ -z "$t" ] && continue
+    list="$(awk -F'|' -v tr="$t" '$1==tr {print $2}' "$tmpmap" 2>/dev/null | head -n 20)"
+    count="$(printf '%s\n' "$list" | sed '/^$/d' | wc -l | tr -d ' ')"
+    [ "${count:-0}" -gt 0 ] || continue
+    next="$(printf "ls -la '%s/bin' 2>/dev/null\n# 共 %s 条 PATH 软链落入该树（优先 pspy 确认实际调用名，如 asinfo/asadm）：\n%s\n# 验证：grep -Rns . /etc/crontab /etc/cron.d 2>/dev/null | head\n# 替换软链目标文件后等待 cron/服务调用" \
+      "$t" "$count" "$list")"
+    add_finding HIGH "系统软链指向用户可控树：$t（${count} 条）" \
+      "多个 /usr/bin|/bin 命令名解析到属主/可写树 $t。root 若调用其中任一命令名即可劫持。summary 按树聚合，不逐条刷屏。" \
+      "$next" "symlink:tree:$t"
+  done < <(awk -F'|' '{print $1}' "$tmpmap" 2>/dev/null | sort -u)
+
+  rm -f "$tmpmap" 2>/dev/null || true
 }
 
 check_systemd(){
